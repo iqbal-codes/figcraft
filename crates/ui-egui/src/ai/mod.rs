@@ -185,6 +185,7 @@ impl AiState {
     pub fn stop_active_task(&mut self) {
         self.is_running = false;
         if let Some(sess) = self.sessions.get_mut(self.active_session_idx) {
+            sess.pending_turn_prompt = None;
             if let Some(auth) = sess.task.as_mut() {
                 auth.stop();
             }
@@ -243,12 +244,18 @@ pub fn update_ai_runtime(app: &mut FigApp, ctx: &Context) {
                 }
             }
             protocol::ProtocolEvent::TurnStarted { thread_id, turn_id } => {
-                app.ui.ai.is_running = true;
                 let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
                 if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx) {
-                    sess.active_turn_id = Some(turn_id);
-                    sess.status = TurnStatus::Running;
-                    sess.ensure_assistant_turn();
+                    if sess.status == TurnStatus::Stopped {
+                        if let (Some(sup), Some(tid)) = (app.ui.ai.supervisor.as_mut(), thread_id.as_deref()) {
+                            sup.interrupt_turn(tid, &turn_id);
+                        }
+                    } else {
+                        app.ui.ai.is_running = true;
+                        sess.active_turn_id = Some(turn_id);
+                        sess.status = TurnStatus::Running;
+                        sess.ensure_assistant_turn();
+                    }
                 }
             }
             protocol::ProtocolEvent::AgentDelta { thread_id, turn_id: _, text } => {
@@ -374,7 +381,9 @@ pub fn update_ai_runtime(app: &mut FigApp, ctx: &Context) {
             protocol::ProtocolEvent::TurnCompleted { thread_id, turn_id: _ } => {
                 let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
                 if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx) {
-                    sess.status = TurnStatus::Completed;
+                    if sess.status != TurnStatus::Stopped {
+                        sess.status = TurnStatus::Completed;
+                    }
                     sess.active_turn_id = None;
                 }
                 app.ui.ai.is_running = false;

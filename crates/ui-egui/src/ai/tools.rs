@@ -241,11 +241,12 @@ fn execute_create_text(session: &mut Session, auth: &mut TaskAuthority, params: 
 }
 
 fn execute_create_shape(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
-    let kind = params.get("kind").and_then(Value::as_str).unwrap_or("rectangle");
+    let kind = params.get("kind").or_else(|| params.get("shape")).and_then(Value::as_str).unwrap_or("rectangle");
     let cmd = if kind == "ellipse" { "shape.ellipse" } else { "shape.rectangle" };
     let mut p = params.clone();
     if let Some(obj) = p.as_object_mut() {
         obj.remove("kind");
+        obj.remove("shape");
         if !obj.contains_key("parent") {
             let default_parent = match auth.scope() {
                 TaskScope::NewRoot { task_root, page_id } => task_root.unwrap_or(*page_id),
@@ -315,6 +316,40 @@ fn execute_set_properties(session: &mut Session, auth: &mut TaskAuthority, param
 }
 
 fn execute_batch_commands(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
+    // Validate before recursion: agent-supplied nesting must not exhaust the stack
+    // or admit an unbounded edit group.
+    let mut pending = vec![(params, 0usize)];
+    let mut count = 0usize;
+    while let Some((batch, depth)) = pending.pop() {
+        if depth > 3 {
+            return Err(EngineError::Other("Canvas batch exceeds maximum nesting depth of 3".into()));
+        }
+        let commands = batch
+            .get("commands")
+            .and_then(Value::as_array)
+            .ok_or_else(|| EngineError::Other("canvas_batch_commands requires `commands` array".into()))?;
+        count = count.saturating_add(commands.len());
+        if count > 100 {
+            return Err(EngineError::Other("Canvas batch exceeds maximum of 100 commands".into()));
+        }
+        for command in commands {
+            if command.get("command").and_then(Value::as_str) == Some("canvas_batch_commands") {
+                let nested = command.get("params").ok_or_else(|| EngineError::Other("Nested canvas batch requires params".into()))?;
+                pending.push((nested, depth + 1));
+            }
+        }
+    }
+    let before_auth = auth.clone();
+    // Use the engine's group checkpoint so errors restore the document, undo/redo,
+    // selection and buffered collaboration events together, including nested tools.
+    let result = session.grouped("AI canvas batch", |session| execute_batch_steps(session, auth, params));
+    if result.is_err() {
+        *auth = before_auth;
+    }
+    result
+}
+
+fn execute_batch_steps(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
     let cmds = params
         .get("commands")
         .and_then(Value::as_array)

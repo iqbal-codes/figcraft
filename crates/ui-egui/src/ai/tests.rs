@@ -132,6 +132,72 @@ fn test_ai_state_turn_thread_correlation_and_stop() {
 }
 
 #[test]
+fn test_stop_lifecycle_prevents_late_turn_overwrite_and_tool_mutations() {
+    let transport = MockSupervisorTransport::new();
+    let handle = transport.clone();
+    let supervisor = CodexSupervisor::new(Box::new(transport));
+
+    let mut session = figcraft_engine::Session::new();
+    let _ = session.execute("doc.new", &json!({}));
+    let mut app = crate::FigApp::new(session, Box::new(crate::NoServices));
+    app.ui.ai.supervisor = Some(supervisor);
+
+    // Submit turn to establish running session
+    app.ui.ai.draft_text = "Generate cards".into();
+    app.ui.ai.submit_turn(&mut app.session);
+    assert!(app.ui.ai.is_running);
+    let thread_id = "th_stop_lifecycle_test";
+    app.ui.ai.sessions[0].thread_id = Some(thread_id.into());
+    app.ui.ai.sessions[0].active_turn_id = Some("turn_initial".into());
+
+    // Stop active task
+    app.ui.ai.stop_active_task();
+    assert!(!app.ui.ai.is_running);
+    assert_eq!(app.ui.ai.sessions[0].status, TurnStatus::Stopped);
+    assert!(app.ui.ai.sessions[0].pending_turn_prompt.is_none());
+    let mut auth = app.ui.ai.sessions[0].task.as_ref().unwrap().clone();
+    assert!(auth.is_stopped());
+
+    // Simulate late TurnStarted event arriving after Stop
+    handle.push_incoming(&format!(r#"{{"method":"turn/started","params":{{"threadId":"{thread_id}","turnId":"turn_late"}}}}"#));
+    let ctx = egui::Context::default();
+    super::update_ai_runtime(&mut app, &ctx);
+
+    // Must NOT flip status back to Running or mark is_running true
+    assert!(!app.ui.ai.is_running, "late TurnStarted must not set is_running to true after Stop");
+    assert_eq!(app.ui.ai.sessions[0].status, TurnStatus::Stopped, "late TurnStarted must not overwrite Stopped status");
+
+    // Simulate late AgentDelta event arriving after Stop
+    handle.push_incoming(&format!(
+        r#"{{"method":"item/agentMessage/delta","params":{{"threadId":"{thread_id}","turnId":"turn_late","delta":"unwanted text"}}}}"#
+    ));
+    super::update_ai_runtime(&mut app, &ctx);
+    // Unwanted text must not be appended
+    assert!(
+        !app.ui.ai.sessions[0].messages.iter().any(|m| m.text.contains("unwanted text")),
+        "late AgentDelta must not append text to a stopped session"
+    );
+
+    // Simulate late TurnCompleted event arriving after Stop
+    handle.push_incoming(&format!(r#"{{"method":"turn/completed","params":{{"threadId":"{thread_id}","turnId":"turn_late"}}}}"#));
+    super::update_ai_runtime(&mut app, &ctx);
+
+    // Must remain Stopped, NOT completed
+    assert_eq!(app.ui.ai.sessions[0].status, TurnStatus::Stopped, "late TurnCompleted must not overwrite Stopped status to Completed");
+    assert!(!app.ui.ai.is_running);
+
+    // Verify task authority rejects any late tool execution attempts
+    let tool_res = super::tools::execute_tool(
+        &mut app.session,
+        &mut auth,
+        "canvas_create_shape",
+        &json!({"shape": "rectangle", "x": 0, "y": 0, "width": 50, "height": 50}),
+    );
+    assert!(tool_res.is_err(), "stopped task authority must reject tool execution");
+    assert!(tool_res.unwrap_err().to_string().contains("stopped"));
+}
+
+#[test]
 fn test_event_routing_to_bound_thread_not_active_session() {
     let transport = MockSupervisorTransport::new();
     let supervisor = CodexSupervisor::new(Box::new(transport));
@@ -334,6 +400,95 @@ fn test_canvas_batch_commands_and_text_styling_sanitization() {
     assert!(results[0].get("id").is_some());
     assert!(results[1].get("id").is_some());
     assert!(results[2].get("id").is_some());
+}
+
+#[test]
+fn failed_canvas_tool_batch_preserves_document_and_authority() {
+    let mut session = figcraft_engine::Session::new();
+    let page_id = session.page().unwrap();
+    let doc_uid = session.ds().unwrap().uid;
+    let mut auth = figcraft_engine::TaskAuthority::new("failed-batch", doc_uid, figcraft_engine::TaskScope::NewRoot { page_id, task_root: None });
+    let before_doc = serde_json::to_value(session.doc().unwrap()).unwrap();
+    let before_auth = auth.clone();
+    let result = super::tools::execute_tool(
+        &mut session,
+        &mut auth,
+        "canvas_batch_commands",
+        &json!({
+            "commands": [
+                {"command": "canvas_create_frame", "params": {"name": "Must roll back", "x": 0, "y": 0, "width": 300, "height": 200}},
+                {"command": "file.save", "params": {}}
+            ]
+        }),
+    );
+    assert!(result.is_err(), "out-of-scope second command must fail");
+    assert_eq!(serde_json::to_value(session.doc().unwrap()).unwrap(), before_doc, "failed tool batch left partial edits");
+    assert_eq!(auth, before_auth, "failed tool batch changed task authority");
+}
+
+#[test]
+fn test_canvas_batch_nesting_limits_and_single_undo_group() {
+    let mut session = figcraft_engine::Session::new();
+    let page_id = session.page().unwrap();
+    let doc_uid = session.ds().unwrap().uid;
+    let mut auth =
+        figcraft_engine::TaskAuthority::new("batch-limits-test", doc_uid, figcraft_engine::TaskScope::NewRoot { page_id, task_root: None });
+
+    // 1. Nesting depth limit: build 4 nested batches (depth 4 exceeds max depth 3)
+    let depth4_batch = json!({
+        "commands": [{
+            "command": "canvas_batch_commands",
+            "params": {
+                "commands": [{
+                    "command": "canvas_batch_commands",
+                    "params": {
+                        "commands": [{
+                            "command": "canvas_batch_commands",
+                            "params": {
+                                "commands": [{
+                                    "command": "canvas_batch_commands",
+                                    "params": {
+                                        "commands": []
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }]
+            }
+        }]
+    });
+    let depth_err = super::tools::execute_tool(&mut session, &mut auth, "canvas_batch_commands", &depth4_batch);
+    assert!(depth_err.is_err(), "nesting depth > 3 must be rejected");
+    assert!(depth_err.unwrap_err().to_string().contains("nesting depth"));
+
+    // 2. Total commands count limit: 101 commands
+    let mut many_cmds = Vec::new();
+    for _ in 0..101 {
+        many_cmds.push(json!({"command": "canvas_batch_commands", "params": {"commands": []}}));
+    }
+    let count_err = super::tools::execute_tool(&mut session, &mut auth, "canvas_batch_commands", &json!({"commands": many_cmds}));
+    assert!(count_err.is_err(), "commands count > 100 must be rejected");
+    assert!(count_err.unwrap_err().to_string().contains("maximum of 100 commands"));
+
+    // 3. Successful batch forms a single undo group
+    let before_doc = serde_json::to_value(session.doc().unwrap()).unwrap();
+    let undo_count_before = session.ds().unwrap().history.undo.len();
+    let success_batch = json!({
+        "commands": [
+            {"command": "canvas_create_frame", "params": {"name": "Batch Root", "x": 0, "y": 0, "width": 400, "height": 300}},
+            {"command": "canvas_create_text", "params": {"text": "Hello World", "x": 20, "y": 20, "fontSize": 16.0}},
+            {"command": "canvas_create_shape", "params": {"shape": "rectangle", "x": 20, "y": 60, "width": 100, "height": 50}}
+        ]
+    });
+    let success_res = super::tools::execute_tool(&mut session, &mut auth, "canvas_batch_commands", &success_batch);
+    assert!(success_res.is_ok(), "valid batch must succeed: {:?}", success_res);
+    let undo_count_after = session.ds().unwrap().history.undo.len();
+    assert_eq!(undo_count_after, undo_count_before + 1, "entire tool batch must commit as exactly one undo group");
+
+    // Single undo rolls back the entire batch
+    assert!(session.undo().unwrap(), "undo must succeed");
+    assert_eq!(serde_json::to_value(session.doc().unwrap()).unwrap(), before_doc, "single undo must completely restore document to pre-batch state");
 }
 
 #[test]
