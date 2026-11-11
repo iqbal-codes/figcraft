@@ -272,3 +272,81 @@ fn deleting_outside_scope_rejected_and_deleting_inside_recorded() {
     assert!(s.doc().unwrap().contains(pre_sibling), "pre_sibling must still exist");
     assert_eq!(task.provenance().deleted_nodes, before_provenance.deleted_nodes, "Provenance deleted_nodes must be rolled back");
 }
+
+#[test]
+fn test_rejected_out_of_scope_mutation_preserves_redo_history_revision_and_events() {
+    let mut s = Session::new();
+    let page_id = s.page().unwrap();
+
+    // 1. Establish an existing undo/redo stack
+    s.execute("shape.rectangle", &json!({"x": 10, "y": 10, "width": 100, "height": 50})).unwrap();
+    let (undo_before, redo_before) = s.undo_depth();
+    assert_eq!(undo_before, 1);
+    assert_eq!(redo_before, 0);
+
+    // Undo the shape creation so redo has 1 item
+    assert!(s.undo().unwrap());
+    let (undo_after_undo, redo_after_undo) = s.undo_depth();
+    assert_eq!(undo_after_undo, 0);
+    assert_eq!(redo_after_undo, 1, "Must have 1 redo entry before task execution");
+
+    let doc_uid = s.ds().unwrap().uid;
+    let rev_before_task = s.ds().unwrap().revision;
+    let mut task = TaskAuthority::new("task-test-redo", doc_uid, TaskScope::NewRoot { page_id, task_root: None });
+
+    // 2. Execute an out-of-scope mutation: modify nonexistent or out-of-scope node
+    let bad_res = task.execute(&mut s, "node.set", &json!({"id": 99999, "props": {"name": "Bad"}}));
+    assert!(bad_res.is_err(), "Out-of-scope mutation must fail");
+
+    // 3. Verify ALL transactional state is preserved:
+    // Redo history MUST still be 1!
+    let (undo_after_fail, redo_after_fail) = s.undo_depth();
+    assert_eq!(redo_after_fail, 1, "Redo stack must NOT be cleared by rejected out-of-scope mutation");
+    assert_eq!(undo_after_fail, 0, "Undo stack must be restored to pre-task state");
+    assert_eq!(s.ds().unwrap().revision, rev_before_task, "Revision must be restored on failed mutation");
+
+    // Redo must work cleanly and restore the shape
+    assert!(s.redo().unwrap());
+    assert_eq!(s.undo_depth().0, 1);
+}
+
+#[test]
+fn test_task_authority_revision_tracking_and_concurrent_external_edits() {
+    let mut s = Session::new();
+    let page_id = s.page().unwrap();
+
+    // Create target frame and unrelated sibling frame
+    let target = id_of(&s.execute("frame.create", &json!({"x": 10, "y": 10, "width": 200, "height": 200, "name": "Target Frame"})).unwrap());
+    let sibling = id_of(&s.execute("frame.create", &json!({"x": 300, "y": 10, "width": 100, "height": 100, "name": "Sibling Frame"})).unwrap());
+
+    let doc_uid = s.ds().unwrap().uid;
+    let initial_rev = s.ds().unwrap().revision;
+
+    // Create task authority: captures identity and initial revision
+    let mut task =
+        TaskAuthority::new_with_revision("task-test-concurrent", doc_uid, initial_rev, TaskScope::Subtree { page_id, target_node: target });
+    assert_eq!(task.revision(), initial_rev);
+
+    // Human performs an external concurrent edit on the UNRELATED sibling
+    s.execute("node.set", &json!({"id": sibling.0, "props": {"name": "Human Edited Sibling"}})).unwrap();
+    let external_rev = s.ds().unwrap().revision;
+    assert!(external_rev > initial_rev, "External edit must bump document revision");
+
+    // Task now executes mutation on TARGET: should detect external revision change,
+    // revalidate that target node is still intact, and succeed without reverting sibling
+    let res = task.execute(&mut s, "node.set", &json!({"id": target.0, "props": {"name": "Agent Edited Target"}}));
+    assert!(res.is_ok(), "Mutation on valid target after concurrent edit should succeed: {:?}", res);
+
+    // Verify both edits are preserved
+    assert_eq!(s.doc().unwrap().node(sibling).unwrap().name, "Human Edited Sibling");
+    assert_eq!(s.doc().unwrap().node(target).unwrap().name, "Agent Edited Target");
+    assert_eq!(task.revision(), s.ds().unwrap().revision, "Task must account for own task revision");
+
+    // Now test external deletion of target node
+    s.execute("edit.delete", &json!({"ids": [target.0]})).unwrap();
+    assert!(!s.doc().unwrap().contains(target));
+
+    // Subsequent task execution must be rejected because target node was deleted externally
+    let after_delete_res = task.execute(&mut s, "shape.rectangle", &json!({"parent": target.0, "x": 10, "y": 10, "width": 20, "height": 20}));
+    assert!(after_delete_res.is_err(), "Mutation must fail when target node was deleted externally");
+}

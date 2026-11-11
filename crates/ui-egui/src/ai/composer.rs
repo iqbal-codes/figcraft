@@ -46,17 +46,20 @@ pub fn show(app: &mut FigApp, ui: &mut Ui) {
         if output.response.has_focus() && !is_running {
             let enter = ui.input(|i| i.key_pressed(Key::Enter));
             let shift = ui.input(|i| i.modifiers.contains(Modifiers::SHIFT));
-            if enter && !shift {
+            let ime_active = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
+            if enter && !shift && !ime_active {
                 submit_pressed = true;
             }
         }
     });
 
-    // Lower bar: Model chip on left, Stop or Send on right
+    // Lower bar: Model and effort chip on left, Stop or Send on right
     let bar_y = comp_rect.max.y - 28.0;
-    let model_rect = Rect::from_min_size(pos2(comp_rect.min.x + 8.0, bar_y), vec2(80.0, 22.0));
     let model_text = if app.ui.ai.selected_model.is_empty() { "gpt-6-luna" } else { &app.ui.ai.selected_model };
-    ui.painter().text(pos2(model_rect.min.x, model_rect.center().y), Align2::LEFT_CENTER, model_text, regular(10.0), t.text_secondary);
+    let effort_text = app.ui.ai.selected_effort.as_deref().unwrap_or("medium");
+    let chip_text = format!("{model_text} · {effort_text}");
+    let model_rect = Rect::from_min_size(pos2(comp_rect.min.x + 8.0, bar_y), vec2(150.0, 22.0));
+    ui.painter().text(pos2(model_rect.min.x, model_rect.center().y), Align2::LEFT_CENTER, chip_text, regular(10.0), t.text_secondary);
 
     if is_running {
         // Stop button

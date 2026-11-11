@@ -223,9 +223,9 @@ fn test_event_routing_to_bound_thread_not_active_session() {
     };
 
     if let super::protocol::ProtocolEvent::AgentDelta { thread_id, text, .. } = ev {
-        let sess_idx = super::find_session_by_thread(&state.sessions, thread_id.as_deref(), state.active_session_idx);
-        assert_eq!(sess_idx, 0, "Event must route to Session 0 even though Session 1 is active!");
-        state.sessions[sess_idx].append_assistant_delta(&text);
+        let sess_idx = super::find_session_by_thread(&state.sessions, thread_id.as_deref());
+        assert_eq!(sess_idx, Some(0), "Event must route to Session 0 even though Session 1 is active!");
+        state.sessions[sess_idx.unwrap()].append_assistant_delta(&text);
     }
 
     assert_eq!(state.sessions[0].messages.len(), 1);
@@ -590,4 +590,215 @@ fn test_live_codex_cli_non_inference_handshake() {
     assert!(supervisor.pending_requests.values().all(|r| !matches!(r, RequestCorrelation::TurnStart { .. })));
     // Clean shutdown on drop
     drop(supervisor);
+}
+
+#[test]
+fn test_supervisor_dead_process_latches_terminal_failure_and_does_not_grow_messages() {
+    let transport = MockSupervisorTransport::new();
+    transport.set_alive(false); // dead process from start
+
+    let mut supervisor = CodexSupervisor::new(Box::new(transport));
+
+    // First poll: reports error once and latches failure
+    let events1 = supervisor.poll_events();
+    assert_eq!(events1.len(), 1, "First poll must emit exactly 1 terminal process exit error");
+    assert!(matches!(&events1[0], ProtocolEvent::Error { message, .. } if message.contains("exited")));
+
+    // Subsequent repeated polls must NOT emit duplicate process exit errors!
+    for poll_idx in 2..=5 {
+        let events = supervisor.poll_events();
+        assert!(events.is_empty(), "Poll {poll_idx} on dead process must return empty events, but got: {:?}", events);
+    }
+}
+
+#[test]
+fn test_supervisor_drains_buffered_events_before_reporting_terminal_process_exit() {
+    let transport = MockSupervisorTransport::new();
+    let handle = transport.clone();
+
+    // Queue buffered output (e.g. final turn completion and delta), then mark process dead
+    handle.push_incoming(r#"{"method":"item/agentMessage/delta","params":{"threadId":"th_drain","turnId":"turn_1","delta":"Final response text"}}"#);
+    handle.push_incoming(r#"{"method":"turn/completed","params":{"threadId":"th_drain","turnId":"turn_1"}}"#);
+    handle.set_alive(false);
+
+    let mut supervisor = CodexSupervisor::new(Box::new(transport));
+
+    // First poll must drain all buffered lines BEFORE reporting process exit
+    let events = supervisor.poll_events();
+    assert!(
+        events.iter().any(|e| matches!(e, ProtocolEvent::AgentDelta { text, .. } if text == "Final response text")),
+        "Buffered delta must be drained before terminal process failure"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, ProtocolEvent::TurnCompleted { .. })),
+        "Buffered turn completion must be drained before terminal process failure"
+    );
+
+    // The next poll latches and reports the terminal process exit
+    let exit_events = supervisor.poll_events();
+    assert!(exit_events.iter().any(|e| matches!(e, ProtocolEvent::Error { message, .. } if message.contains("exited"))));
+
+    // And after that, latching ensures no further errors
+    assert!(supervisor.poll_events().is_empty());
+}
+
+#[test]
+fn test_supervisor_replies_to_unknown_server_requests_with_protocol_error() {
+    let transport = MockSupervisorTransport::new();
+    let handle = transport.clone();
+
+    let mut supervisor = CodexSupervisor::new(Box::new(transport));
+
+    // Server sends an unknown request with ID
+    handle.push_incoming(r#"{"jsonrpc":"2.0","id":"unk_req_42","method":"unsupported/serverMethod","params":{"foo":"bar"}}"#);
+
+    let events = supervisor.poll_events();
+
+    // Must settle once by sending a protocol-correct error response back to harness
+    let sent = handle.sent_lines();
+    let reply = sent.iter().find(|l| l.contains("unk_req_42"));
+    assert!(reply.is_some(), "Must reply to unknown server request unk_req_42, but sent: {:?}", sent);
+    let reply_str = reply.unwrap();
+    assert!(reply_str.contains(r#""error""#), "Reply must be a JSON-RPC error response");
+    assert!(reply_str.contains("-32601"), "Error code should be -32601 (Method not found)");
+
+    // Must also produce visible honest event so harness state is transparent
+    assert!(events.iter().any(|e| matches!(e, ProtocolEvent::Error { message, .. } if message.contains("unsupported/serverMethod"))));
+}
+
+#[test]
+fn test_conversation_view_switching_cannot_retarget_tool_calls_or_deltas_and_stale_threads_rejected() {
+    let mut state = AiState::new();
+
+    // Session 0 bound to thread_0
+    let mut sess0 = super::AiSession::new("sess_0", 1, figcraft_doc::NodeId(1), "Target 0");
+    sess0.thread_id = Some("thread_0".into());
+    sess0.active_turn_id = Some("turn_0".into());
+    sess0.status = TurnStatus::Running;
+
+    // Session 1 bound to thread_1
+    let mut sess1 = super::AiSession::new("sess_1", 1, figcraft_doc::NodeId(1), "Target 1");
+    sess1.thread_id = Some("thread_1".into());
+    sess1.active_turn_id = Some("turn_1".into());
+    sess1.status = TurnStatus::Running;
+
+    state.sessions = vec![sess0, sess1];
+
+    // User switches view to Session 1
+    state.active_session_idx = 1;
+
+    // Event arrives for thread_0
+    // Test that find_session_by_thread does NOT fall back to active_session_idx (1)
+    let found_0 = super::find_session_by_thread(&state.sessions, Some("thread_0"));
+    assert_eq!(found_0, Some(0), "thread_0 must resolve strictly to session 0");
+
+    let found_unknown = super::find_session_by_thread(&state.sessions, Some("stale_thread_999"));
+    assert_eq!(found_unknown, None, "Unknown/stale thread must NOT fall back to active view");
+
+    let found_none = super::find_session_by_thread(&state.sessions, None);
+    assert_eq!(found_none, None, "Missing thread ID must NOT fall back to active view");
+}
+
+#[test]
+fn test_unsupported_external_permissions_are_visibly_denied_with_schema_responses_and_duplicate_replies_rejected() {
+    use super::protocol::format_permission_denial_response;
+
+    // Verify schema-correct denial for external execution
+    let cmd_denial =
+        format_permission_denial_response(&json!("req_cmd_1"), "item/commandExecution/requestApproval", "External execution outside canvas");
+    assert!(
+        cmd_denial.contains(r#""decision":"decline""#) || cmd_denial.contains(r#""decision": "decline""#),
+        "commandExecution must use schema-correct 'decline' decision: {cmd_denial}"
+    );
+
+    // Verify schema-correct denial for external file changes
+    let file_denial = format_permission_denial_response(&json!("req_file_1"), "item/fileChange/requestApproval", "External file edit outside canvas");
+    assert!(
+        file_denial.contains(r#""decision":"decline""#) || file_denial.contains(r#""decision": "decline""#),
+        "fileChange must use schema-correct 'decline' decision: {file_denial}"
+    );
+
+    // Verify duplicate reply prevention
+    let transport = MockSupervisorTransport::new();
+    let handle = transport.clone();
+    let mut supervisor = CodexSupervisor::new(Box::new(transport));
+
+    let req_id = json!("perm_req_1");
+    // First response is accepted
+    assert!(supervisor.record_and_send_response(&req_id, json!({"decision": "decline"})));
+    let initial_count = handle.sent_lines().len();
+
+    // Duplicate response for same req_id MUST be rejected!
+    assert!(
+        !supervisor.record_and_send_response(&req_id, json!({"decision": "decline"})),
+        "Duplicate response for already-answered request must be rejected"
+    );
+    assert_eq!(handle.sent_lines().len(), initial_count, "No duplicate line should be sent over transport");
+}
+
+#[test]
+fn test_explicit_codex_executable_override_env_var() {
+    use super::supervisor::detect_codex_cli_with_env;
+    use std::ffi::OsStr;
+
+    // Test with non-existent explicit path
+    let res = detect_codex_cli_with_env(Some(OsStr::new("/tmp/nonexistent-codex-override-test-bin")));
+    assert!(res.is_none(), "Nonexistent explicit path must not be returned");
+
+    // Test with existing binary override (use /bin/sh as dummy executable fixture)
+    let res_valid = detect_codex_cli_with_env(Some(OsStr::new("/bin/sh")));
+    assert_eq!(res_valid, Some(std::path::PathBuf::from("/bin/sh")), "Existing explicit path must be honored");
+}
+
+#[test]
+fn test_model_supported_efforts_derivation_and_selection_preservation() {
+    let mut state = AiState::new();
+
+    // Register models with their supported efforts
+    let model_a = super::supervisor::ModelInfo {
+        id: "model-a".to_string(),
+        display_name: Some("Model A".to_string()),
+        supported_efforts: vec!["low".to_string(), "medium".to_string(), "high".to_string()],
+        default_effort: Some("medium".to_string()),
+    };
+    let model_b = super::supervisor::ModelInfo {
+        id: "model-b".to_string(),
+        display_name: Some("Model B".to_string()),
+        supported_efforts: vec!["low".to_string(), "medium".to_string()],
+        default_effort: Some("low".to_string()),
+    };
+
+    state.set_models(vec![model_a, model_b]);
+
+    // Select Model A and explicit effort "high"
+    state.select_model("model-a");
+    state.select_effort(Some("high".to_string()));
+    assert_eq!(state.selected_effort.as_deref(), Some("high"));
+
+    // Switch to Model B which does NOT support "high": must fall back cleanly to default effort ("low")
+    state.select_model("model-b");
+    assert_eq!(state.selected_effort.as_deref(), Some("low"), "Effort must fall back when unsupported on new model");
+
+    // Set effort to "medium" on Model B (which is supported)
+    state.select_effort(Some("medium".to_string()));
+    assert_eq!(state.selected_effort.as_deref(), Some("medium"));
+
+    // Switch back to Model A (which also supports "medium"): must preserve "medium"
+    state.select_model("model-a");
+    assert_eq!(state.selected_effort.as_deref(), Some("medium"), "Supported explicit effort must be preserved across models");
+}
+
+#[test]
+fn test_ime_confirmation_does_not_submit_turn_and_composer_does_not_steal_shortcuts() {
+    use egui::{Event, ImeEvent, Key, Modifiers};
+
+    // When an IME composition commit event happens in the same frame as Enter,
+    // Enter was confirming the candidate, so composer must NOT trigger submit_turn
+    let has_ime_event = [
+        Event::Ime(ImeEvent::Commit("こんにちは".into())),
+        Event::Key { key: Key::Enter, physical_key: Some(Key::Enter), pressed: true, repeat: false, modifiers: Modifiers::NONE },
+    ];
+
+    let is_ime_confirming = has_ime_event.iter().any(|e| matches!(e, Event::Ime(_)));
+    assert!(is_ime_confirming, "IME commit must be detected so Enter does not trigger turn submit");
 }

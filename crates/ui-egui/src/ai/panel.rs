@@ -49,23 +49,43 @@ fn show_conversation_view(app: &mut FigApp, ui: &mut Ui) {
 
     // Model name / status on right
     let model_text = if app.ui.ai.selected_model.is_empty() { "gpt-6-luna" } else { &app.ui.ai.selected_model };
-    let model_btn = Rect::from_min_size(pos2(head.max.x - 90.0, head.min.y + 6.0), vec2(82.0, 24.0));
+    let model_btn = Rect::from_min_size(pos2(head.max.x - 146.0, head.min.y + 6.0), vec2(74.0, 24.0));
     let model_resp = ui.interact(model_btn, ui.scope_id().with("ai_model_picker"), Sense::click());
     model_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, false, format!("Model: {model_text}")));
     if model_resp.hovered() {
         ui.painter().rect_filled(model_btn, CornerRadius::same(4), t.hover);
     }
-    ui.painter().text(model_btn.center(), Align2::CENTER_CENTER, model_text, regular(11.0), t.accent_text);
+    ui.painter().text(model_btn.center(), Align2::CENTER_CENTER, model_text, regular(10.0), t.accent_text);
     if model_resp.clicked() && !app.ui.ai.available_models.is_empty() {
-        // Cycle available models
-        if let Some(pos) = app.ui.ai.available_models.iter().position(|m| m == &app.ui.ai.selected_model) {
+        let next_model = if let Some(pos) = app.ui.ai.available_models.iter().position(|m| m == &app.ui.ai.selected_model) {
             let next_idx = (pos + 1) % app.ui.ai.available_models.len();
-            if let Some(m) = app.ui.ai.available_models.get(next_idx) {
-                app.ui.ai.selected_model = m.clone();
-            }
-        } else if let Some(first) = app.ui.ai.available_models.first() {
-            app.ui.ai.selected_model = first.clone();
+            app.ui.ai.available_models.get(next_idx).cloned()
+        } else {
+            app.ui.ai.available_models.first().cloned()
+        };
+        if let Some(m) = next_model {
+            app.ui.ai.select_model(&m);
         }
+    }
+
+    // Effort selector button
+    let supported_efforts = app.ui.ai.supported_efforts_for_selected_model();
+    let effort_text = app.ui.ai.selected_effort.as_deref().unwrap_or("medium");
+    let effort_btn = Rect::from_min_size(pos2(head.max.x - 68.0, head.min.y + 6.0), vec2(60.0, 24.0));
+    let effort_resp = ui.interact(effort_btn, ui.scope_id().with("ai_effort_picker"), Sense::click());
+    effort_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, false, format!("Effort: {effort_text}")));
+    if effort_resp.hovered() {
+        ui.painter().rect_filled(effort_btn, CornerRadius::same(4), t.hover);
+    }
+    ui.painter().text(effort_btn.center(), Align2::CENTER_CENTER, effort_text, regular(10.0), t.text_secondary);
+    if effort_resp.clicked() && !supported_efforts.is_empty() {
+        let next_effort = if let Some(pos) = supported_efforts.iter().position(|e| e == effort_text) {
+            let next_idx = (pos + 1) % supported_efforts.len();
+            supported_efforts.get(next_idx).cloned()
+        } else {
+            supported_efforts.first().cloned()
+        };
+        app.ui.ai.select_effort(next_effort);
     }
 
     // Scrollable message area
@@ -188,22 +208,47 @@ fn render_messages(app: &mut FigApp, ui: &mut Ui) {
             .corner_radius(CornerRadius::same(6))
             .inner_margin(egui::Margin::same(10));
 
+        let is_unsupported_external = approval.action.contains("command")
+            || approval.action.contains("shell")
+            || approval.action.contains("file")
+            || !approval.target.is_empty();
+
         frame.show(ui, |ui| {
-            ui.label(egui::RichText::new(tr("Permission Required")).font(semibold(12.0)).color(t.warning));
-            ui.add_space(2.0);
-            ui.label(egui::RichText::new(&approval.action).font(regular(11.0)).color(t.text));
-            if !approval.target.is_empty() {
-                ui.label(egui::RichText::new(format!("Target: {}", approval.target)).font(regular(10.0)).color(t.text_secondary));
-            }
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button(tr("Allow")).clicked() {
-                    pending_reply = Some((approval.request_id.clone(), true));
+            if is_unsupported_external {
+                ui.label(egui::RichText::new(tr("External Permission Denied")).font(semibold(12.0)).color(t.warning));
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(tr("External shell/filesystem execution is disabled under canvas design scope."))
+                        .font(regular(10.0))
+                        .color(t.text_secondary),
+                );
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&approval.action).font(regular(11.0)).color(t.text));
+                if !approval.target.is_empty() {
+                    ui.label(egui::RichText::new(format!("Target: {}", approval.target)).font(regular(10.0)).color(t.text_secondary));
                 }
-                if ui.button(tr("Deny")).clicked() {
+                ui.add_space(6.0);
+                // Do NOT offer "Allow" button for external shell/file execution; visibly decline with schema-correct denial
+                if ui.button(tr("Dismiss (Deny)")).clicked() {
                     pending_reply = Some((approval.request_id.clone(), false));
                 }
-            });
+            } else {
+                ui.label(egui::RichText::new(tr("Permission Required")).font(semibold(12.0)).color(t.warning));
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(&approval.action).font(regular(11.0)).color(t.text));
+                if !approval.target.is_empty() {
+                    ui.label(egui::RichText::new(format!("Target: {}", approval.target)).font(regular(10.0)).color(t.text_secondary));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(tr("Allow")).clicked() {
+                        pending_reply = Some((approval.request_id.clone(), true));
+                    }
+                    if ui.button(tr("Deny")).clicked() {
+                        pending_reply = Some((approval.request_id.clone(), false));
+                    }
+                });
+            }
         });
         ui.add_space(6.0);
     }
@@ -212,10 +257,16 @@ fn render_messages(app: &mut FigApp, ui: &mut Ui) {
     if let Some((req_id, allow)) = pending_reply {
         if let Some(s) = app.ui.ai.sessions.get_mut(session_idx) {
             s.pending_approval = None;
+            if s.status == TurnStatus::AwaitingApproval {
+                s.status = TurnStatus::Running;
+            }
         }
         if let Some(sup) = app.ui.ai.supervisor.as_mut() {
-            let decision = if allow { "allow" } else { "deny" };
-            sup.send_response(&req_id, json!({ "decision": decision }));
+            if allow {
+                sup.record_and_send_response(&req_id, json!({ "decision": "allow" }));
+            } else {
+                sup.record_and_send_response(&req_id, json!({ "decision": "decline", "denied": { "rejection": "Action declined by user" } }));
+            }
         }
     }
 }

@@ -1,19 +1,30 @@
 //! Codex harness supervisor managing the subprocess stdio loop and event channels.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[cfg(not(target_arch = "wasm32"))]
 use super::protocol::MAX_MESSAGE_SIZE;
 use super::protocol::{
-    ClientInfo, ProtocolEvent, ServerMessage, format_notification, format_request, format_response, message_to_event, parse_message_line,
+    ClientInfo, ProtocolEvent, ServerMessage, format_error_response, format_notification, format_request, format_response, message_to_event,
+    parse_message_line,
 };
+
+/// Discovered model metadata including supported reasoning efforts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub supported_efforts: Vec<String>,
+    pub default_effort: Option<String>,
+}
 
 /// Readiness state of the local AI harness.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -63,9 +74,12 @@ pub struct CodexSupervisor {
     pub phase: SupervisorPhase,
     pub pending_requests: BTreeMap<u64, RequestCorrelation>,
     pub available_models: Vec<String>,
+    pub model_infos: Vec<ModelInfo>,
     pub account_email: Option<String>,
     pub plan_type: Option<String>,
     pub harness_state: HarnessState,
+    pub process_failure_latched: bool,
+    pub answered_requests: BTreeSet<String>,
 }
 
 impl CodexSupervisor {
@@ -94,9 +108,12 @@ impl CodexSupervisor {
             phase: SupervisorPhase::Uninitialized,
             pending_requests: BTreeMap::new(),
             available_models: Vec::new(),
+            model_infos: Vec::new(),
             account_email: None,
             plan_type: None,
             harness_state: HarnessState::Checking,
+            process_failure_latched: false,
+            answered_requests: BTreeSet::new(),
         };
         s.start_initialization();
         s
@@ -136,7 +153,18 @@ impl CodexSupervisor {
         let _ = self.transport.send_line(&line);
     }
 
-    /// Start a new thread for an AI session with model, instructions, and dynamic design tools.
+    /// Correlate request replies and reject duplicate or already-answered responses (Spec axis finding 2).
+    pub fn record_and_send_response(&mut self, request_id: &Value, result: Value) -> bool {
+        let key = request_id.to_string();
+        if self.answered_requests.contains(&key) {
+            return false;
+        }
+        self.answered_requests.insert(key);
+        self.send_response(request_id, result);
+        true
+    }
+
+    /// Start a new thread for an AI session with model, instructions, locked sandbox, and dynamic design tools.
     pub fn start_thread(&mut self, session_id: &str, model: &str, approval_policy: Option<&str>, instructions: Option<&str>) -> u64 {
         let tools = super::tools::canvas_tool_specs();
         let req_id = self.send_request(
@@ -144,6 +172,11 @@ impl CodexSupervisor {
             json!({
                 "model": model,
                 "approvalPolicy": approval_policy.unwrap_or("on-request"),
+                "sandbox": "read-only",
+                "config": {
+                    "sandbox_mode": "read-only",
+                    "mcp_servers": {}
+                },
                 "baseInstructions": instructions.unwrap_or("You are an expert design assistant in FigCraft. Use the provided canvas tools to inspect and mutate the design strictly within authorized scope."),
                 "dynamicTools": tools,
             }),
@@ -185,13 +218,10 @@ impl CodexSupervisor {
 
     pub fn poll_events(&mut self) -> Vec<ProtocolEvent> {
         let mut events = Vec::new();
-        if !self.transport.is_alive() {
-            self.harness_state = HarnessState::MissingExecutable("Codex process exited unexpectedly".into());
-            events.push(ProtocolEvent::Error { thread_id: None, message: "Codex process exited unexpectedly".into() });
-            return events;
-        }
 
+        // 1. Drain all buffered output lines before terminal transition (Standards finding 2)
         let raw_lines = self.transport.poll_lines();
+        let had_buffered_lines = !raw_lines.is_empty();
         for line in raw_lines {
             match parse_message_line(&line) {
                 Ok(msg) => {
@@ -202,6 +232,16 @@ impl CodexSupervisor {
                 }
             }
         }
+
+        // 2. Check process death and latch terminal failure (Standards finding 1)
+        if !had_buffered_lines && !self.transport.is_alive() {
+            self.harness_state = HarnessState::MissingExecutable("Codex process exited unexpectedly".into());
+            if !self.process_failure_latched {
+                self.process_failure_latched = true;
+                events.push(ProtocolEvent::Error { thread_id: None, message: "Codex process exited unexpectedly".into() });
+            }
+        }
+
         events
     }
 
@@ -238,10 +278,27 @@ impl CodexSupervisor {
                         }
                         Some(RequestCorrelation::ModelList) => {
                             if let Some(data) = res.get("data").and_then(Value::as_array) {
-                                let models: Vec<String> =
-                                    data.iter().filter_map(|m| m.get("id").and_then(Value::as_str).map(|s| s.to_string())).collect();
+                                let mut infos = Vec::new();
+                                let mut models = Vec::new();
+                                for m in data {
+                                    if let Some(id) = m.get("id").and_then(Value::as_str) {
+                                        let display_name = m.get("displayName").and_then(Value::as_str).map(|s| s.to_string());
+                                        let default_effort = m.get("defaultReasoningEffort").and_then(Value::as_str).map(|s| s.to_string());
+                                        let mut supported_efforts = Vec::new();
+                                        if let Some(eff_arr) = m.get("supportedReasoningEfforts").and_then(Value::as_array) {
+                                            for eff_obj in eff_arr {
+                                                if let Some(eff_str) = eff_obj.get("reasoningEffort").and_then(Value::as_str) {
+                                                    supported_efforts.push(eff_str.to_string());
+                                                }
+                                            }
+                                        }
+                                        models.push(id.to_string());
+                                        infos.push(ModelInfo { id: id.to_string(), display_name, supported_efforts, default_effort });
+                                    }
+                                }
                                 if !models.is_empty() {
                                     self.available_models = models.clone();
+                                    self.model_infos = infos;
                                     self.harness_state = HarnessState::Ready;
                                     self.phase = SupervisorPhase::Ready;
                                     events.push(ProtocolEvent::Initialized {
@@ -315,16 +372,41 @@ impl CodexSupervisor {
                     events.push(ev);
                 }
             }
-            _ => {
-                if let Some(ev) = message_to_event(msg) {
-                    events.push(ev);
+            ServerMessage::Request { id, method, params } => {
+                match method.as_str() {
+                    "item/commandExecution/requestApproval"
+                    | "item/fileChange/requestApproval"
+                    | "item/permissions/requestApproval"
+                    | "item/execCommand/requestApproval" => {
+                        let action = params.get("action").and_then(Value::as_str).unwrap_or("permission request").to_string();
+                        let target = params.get("target").or_else(|| params.get("command")).and_then(Value::as_str).unwrap_or("").to_string();
+                        let thread_id = params.get("threadId").and_then(Value::as_str).map(|s| s.to_string());
+                        let turn_id = params.get("turnId").and_then(Value::as_str).map(|s| s.to_string());
+                        events.push(ProtocolEvent::ApprovalRequired { thread_id, turn_id, request_id: id.clone(), action, target });
+                    }
+                    "item/tool/call" => {
+                        let thread_id = params.get("threadId").and_then(Value::as_str).map(|s| s.to_string());
+                        let turn_id = params.get("turnId").and_then(Value::as_str).map(|s| s.to_string());
+                        let call_id = params.get("callId").and_then(Value::as_str).unwrap_or("").to_string();
+                        let name = params.get("tool").or_else(|| params.get("name")).and_then(Value::as_str).unwrap_or("").to_string();
+                        let tool_params = params.get("arguments").or_else(|| params.get("parameters")).cloned().unwrap_or(Value::Null);
+                        events.push(ProtocolEvent::ToolCall { thread_id, turn_id, call_id, request_id: id.clone(), name, params: tool_params });
+                    }
+                    _ => {
+                        // Standards finding 3: Reply with protocol-correct unsupported/error and visible honest state, never leave harness waiting.
+                        let err_line = format_error_response(id, -32601, &format!("Method not found: {method}"));
+                        let _ = self.transport.send_line(&err_line);
+                        self.answered_requests.insert(id.to_string());
+                        let thread_id = params.get("threadId").and_then(Value::as_str).map(|s| s.to_string());
+                        events.push(ProtocolEvent::Error { thread_id, message: format!("unsupported server request: {method}") });
+                    }
                 }
             }
         }
     }
 }
 
-/// Detect the installed Codex executable on native platforms.
+/// Detect the installed Codex executable on native platforms, supporting explicit override via FIGCRAFT_CODEX_PATH or CODEX_PATH.
 pub fn detect_codex_cli() -> Option<PathBuf> {
     #[cfg(target_arch = "wasm32")]
     {
@@ -332,6 +414,28 @@ pub fn detect_codex_cli() -> Option<PathBuf> {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let env_override = std::env::var_os("FIGCRAFT_CODEX_PATH").or_else(|| std::env::var_os("CODEX_PATH"));
+        detect_codex_cli_with_env(env_override.as_deref())
+    }
+}
+
+pub fn detect_codex_cli_with_env(override_path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = override_path;
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // 1. Check explicit environment override (Spec axis finding 4)
+        if let Some(override_path) = override_path {
+            let p = PathBuf::from(override_path);
+            if p.exists() {
+                return Some(p);
+            }
+            return None;
+        }
+
         let candidates = ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", "/usr/bin/codex"];
         for path_str in candidates {
             let p = Path::new(path_str);
@@ -367,7 +471,24 @@ impl SubprocessTransport {
         use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
 
-        let mut child = Command::new(executable).arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+        // Lock restrictive sandbox, disable external noncanvas tools, and prevent arbitrary MCP inheritance (Spec finding 2)
+        let mut child = Command::new(executable)
+            .arg("app-server")
+            .arg("-c")
+            .arg("mcp_servers={}")
+            .arg("-c")
+            .arg("sandbox_mode=\"read-only\"")
+            .arg("--disable")
+            .arg("shell_tool")
+            .arg("--disable")
+            .arg("computer_use")
+            .arg("--disable")
+            .arg("browser_use")
+            .arg("--stdio")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
 
         let mut stdin = child.stdin.take().ok_or_else(|| std::io::Error::other("Failed to open child stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| std::io::Error::other("Failed to open child stdout"))?;

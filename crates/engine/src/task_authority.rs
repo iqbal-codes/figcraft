@@ -52,6 +52,7 @@ pub struct TaskEditGroup {
 pub struct TaskAuthority {
     pub task_id: String,
     pub doc_uid: u64,
+    pub revision: u64,
     pub scope: TaskScope,
     pub stopped: bool,
     pub provenance: TaskProvenance,
@@ -60,7 +61,12 @@ pub struct TaskAuthority {
 impl TaskAuthority {
     /// Create a new task authority bound to `doc_uid` and `scope`.
     pub fn new(task_id: impl Into<String>, doc_uid: u64, scope: TaskScope) -> Self {
-        Self { task_id: task_id.into(), doc_uid, scope, stopped: false, provenance: TaskProvenance::default() }
+        Self::new_with_revision(task_id, doc_uid, 0, scope)
+    }
+
+    /// Create a new task authority capturing host document identity and revision.
+    pub fn new_with_revision(task_id: impl Into<String>, doc_uid: u64, revision: u64, scope: TaskScope) -> Self {
+        Self { task_id: task_id.into(), doc_uid, revision, scope, stopped: false, provenance: TaskProvenance::default() }
     }
 
     pub fn task_id(&self) -> &str {
@@ -69,6 +75,10 @@ impl TaskAuthority {
 
     pub fn doc_uid(&self) -> u64 {
         self.doc_uid
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn scope(&self) -> &TaskScope {
@@ -99,6 +109,35 @@ impl TaskAuthority {
         }
     }
 
+    /// Revalidate target and scope against latest document state after external changes.
+    pub fn revalidate_scope_against_document(&self, doc: &Document) -> Result<()> {
+        match &self.scope {
+            TaskScope::Subtree { page_id, target_node } => {
+                if !doc.contains(*page_id) {
+                    return Err(EngineError::Other(format!("Target page {} was removed externally", page_id.0)));
+                }
+                if !doc.contains(*target_node) {
+                    return Err(EngineError::Other(format!("Authorized target node {} was deleted externally", target_node.0)));
+                }
+                if !is_descendant_of(doc, *target_node, *page_id) && *target_node != *page_id {
+                    return Err(EngineError::Other(format!("Authorized target node {} is no longer on target page {}", target_node.0, page_id.0)));
+                }
+                Ok(())
+            }
+            TaskScope::NewRoot { page_id, task_root } => {
+                if !doc.contains(*page_id) {
+                    return Err(EngineError::Other(format!("Target page {} was removed externally", page_id.0)));
+                }
+                if let Some(root) = task_root
+                    && !doc.contains(*root)
+                {
+                    return Err(EngineError::Other(format!("Established task root {} was deleted externally", root.0)));
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Execute a command under this task's authority and scope.
     pub fn execute(&mut self, session: &mut Session, cmd_id: &str, params: &Value) -> Result<Value> {
         if self.stopped {
@@ -113,35 +152,43 @@ impl TaskAuthority {
             )));
         }
 
-        let before_doc = session.ds()?.doc.clone();
-        let before_selection = session.ds()?.selection.clone();
-        let before_history = session.ds()?.history.undo.len();
+        // Revision validation & refresh after external concurrent changes (Spec axis finding 3)
+        let current_rev = session.ds()?.revision;
+        if self.revision > 0 && current_rev != self.revision {
+            self.revalidate_scope_against_document(&session.ds()?.doc)?;
+            self.revision = current_rev;
+        } else if self.revision == 0 {
+            self.revision = current_rev;
+        }
+
         let backup_scope = self.scope.clone();
         let backup_provenance = self.provenance.clone();
+        let backup_revision = self.revision;
 
-        let mut run_mutation = || -> Result<Value> {
-            Self::verify_allowed_command(cmd_id, params)?;
+        Self::verify_allowed_command(cmd_id, params)?;
 
-            let res_value = session.execute_as(Some(&self.task_id), cmd_id, params)?;
-
-            let after_doc = session.ds()?.doc.clone();
+        let mut mutation_result = None;
+        let res = session.checkpointed(None, |s| {
+            let before_doc = s.ds()?.doc.clone();
+            let res_value = s.execute_as(Some(&self.task_id), cmd_id, params)?;
+            let after_doc = s.ds()?.doc.clone();
             let changed = after_doc.changed_ids(&before_doc, usize::MAX).unwrap_or_default();
-
             self.validate_and_record_scope(&before_doc, &after_doc, &changed, cmd_id)?;
-            Ok(res_value)
-        };
+            mutation_result = Some(res_value);
+            Ok(())
+        });
 
-        match run_mutation() {
-            Ok(val) => Ok(val),
-            Err(err) => {
-                // Atomic rollback of session document, selection, undo history, and task authority state
-                if let Ok(ds) = session.ds_mut() {
-                    ds.doc = before_doc;
-                    ds.selection = before_selection;
-                    ds.history.undo.truncate(before_history);
+        match res {
+            Ok(()) => {
+                if let Ok(ds) = session.ds() {
+                    self.revision = ds.revision;
                 }
+                Ok(mutation_result.unwrap_or(Value::Null))
+            }
+            Err(err) => {
                 self.scope = backup_scope;
                 self.provenance = backup_provenance;
+                self.revision = backup_revision;
                 Err(err)
             }
         }

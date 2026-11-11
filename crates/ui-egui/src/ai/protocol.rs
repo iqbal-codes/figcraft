@@ -206,6 +206,19 @@ pub fn format_dynamic_tool_response(id: &Value, success: bool, text_content: &st
     .to_string()
 }
 
+/// Format a JSON-RPC 2.0 error response.
+pub fn format_error_response(id: &Value, code: i64, message: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message
+        }
+    })
+    .to_string()
+}
+
 /// Format an ApprovalResponse compliant with Codex app-server schema.
 pub fn format_approval_response(id: &Value, allow: bool) -> String {
     json!({
@@ -216,4 +229,38 @@ pub fn format_approval_response(id: &Value, allow: bool) -> String {
         }
     })
     .to_string()
+}
+
+/// Format a schema-correct permission denial response for Codex app-server.
+pub fn format_permission_denial_response(id: &Value, method: &str, reason: &str) -> String {
+    match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "decision": "decline"
+            }
+        })
+        .to_string(),
+        "item/execCommand/requestApproval" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "decision": {
+                    "denied": {
+                        "rejection": reason
+                    }
+                }
+            }
+        })
+        .to_string(),
+        _ => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "decision": "decline"
+            }
+        })
+        .to_string(),
+    }
 }

@@ -1166,7 +1166,10 @@ fn ui_set_view(app: &mut FigApp, ctx: &Context, p: &Value) -> Result<(), String>
         };
     }
     if let Some(m) = p.get("aiModel").and_then(Value::as_str) {
-        app.ui.ai.selected_model = m.to_string();
+        app.ui.ai.select_model(m);
+    }
+    if let Some(eff) = p.get("aiEffort").and_then(Value::as_str) {
+        app.ui.ai.select_effort(Some(eff.to_string()));
     }
     if let Some(draft) = p.get("aiDraft").and_then(Value::as_str) {
         app.ui.ai.draft_text = draft.to_string();
