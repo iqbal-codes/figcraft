@@ -5,6 +5,7 @@ pub mod panel;
 pub mod protocol;
 pub mod sessions;
 pub mod supervisor;
+pub mod tools;
 
 #[cfg(test)]
 mod protocol_tests;
@@ -14,9 +15,10 @@ mod tests;
 pub use panel::AiPanelSubview;
 pub use sessions::{AiMessage, AiSession, DraftAttachment, MessageRole, PendingApproval, ToolCallInfo, ToolStatus, TurnStatus};
 pub use supervisor::{CodexSupervisor, HarnessState};
+pub use tools::{canvas_tool_specs, execute_tool};
 
 use egui::Context;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::FigApp;
 
@@ -26,11 +28,11 @@ pub struct AiState {
     pub active_session_idx: usize,
     pub draft_text: String,
     pub selected_model: String,
+    pub selected_effort: Option<String>,
     pub available_models: Vec<String>,
     pub harness_state: HarnessState,
     pub subview: AiPanelSubview,
     pub is_running: bool,
-    pub active_task: Option<figcraft_engine::TaskAuthority>,
     pub supervisor: Option<CodexSupervisor>,
 }
 
@@ -54,11 +56,11 @@ impl AiState {
             active_session_idx: 0,
             draft_text: String::new(),
             selected_model: "gpt-5.6-sol".to_string(),
+            selected_effort: Some("medium".to_string()),
             available_models: vec!["gpt-5.6-sol".to_string(), "gpt-6.1-sol".to_string()],
             harness_state,
             subview: AiPanelSubview::Conversation,
             is_running: false,
-            active_task: None,
             supervisor,
         }
     }
@@ -80,6 +82,14 @@ impl AiState {
 
     pub fn active_session_mut(&mut self) -> Option<&mut AiSession> {
         self.sessions.get_mut(self.active_session_idx)
+    }
+
+    pub fn active_task(&self) -> Option<&figcraft_engine::TaskAuthority> {
+        self.active_session().and_then(|s| s.task.as_ref())
+    }
+
+    pub fn active_task_mut(&mut self) -> Option<&mut figcraft_engine::TaskAuthority> {
+        self.active_session_mut().and_then(|s| s.task.as_mut())
     }
 
     pub fn create_new_session(&mut self, session: &figcraft_engine::Session) {
@@ -138,19 +148,28 @@ impl AiState {
             figcraft_engine::TaskScope::NewRoot { page_id, task_root: None }
         };
 
-        let task = figcraft_engine::TaskAuthority::new(format!("task_{}", self.active_session_idx), doc_uid, scope);
+        let task_id = format!("task_{}", self.active_session_idx);
+        let task = figcraft_engine::TaskAuthority::new(task_id, doc_uid, scope);
 
-        if let Some(s) = self.sessions.get_mut(self.active_session_idx) {
+        let active_idx = self.active_session_idx;
+        if let Some(s) = self.sessions.get_mut(active_idx) {
             s.append_user_message(&text);
             s.status = TurnStatus::Running;
+            s.task = Some(task);
         }
 
         if let Some(sup) = self.supervisor.as_mut() {
             self.is_running = true;
-            let thread_id = format!("thread-{}", self.active_session_idx);
-            sup.start_turn(&thread_id, &text);
+            if let Some(sess) = self.sessions.get_mut(active_idx) {
+                if let Some(ref tid) = sess.thread_id {
+                    sup.start_turn(&sess.session_id, tid, &self.selected_model, &text, self.selected_effort.as_deref());
+                } else {
+                    sess.pending_turn_prompt = Some(text);
+                    sup.start_thread(&sess.session_id, &self.selected_model, Some("on-request"), None);
+                }
+            }
         } else {
-            if let Some(s) = self.sessions.get_mut(self.active_session_idx) {
+            if let Some(s) = self.sessions.get_mut(active_idx) {
                 let msg = match &self.harness_state {
                     HarnessState::Unavailable(reason) => format!("AI harness unavailable: {reason}"),
                     HarnessState::MissingExecutable(reason) => format!("Codex CLI missing: {reason}"),
@@ -161,20 +180,18 @@ impl AiState {
                 s.status = TurnStatus::Failed;
             }
         }
-
-        self.active_task = Some(task);
     }
 
     pub fn stop_active_task(&mut self) {
         self.is_running = false;
-        if let Some(auth) = self.active_task.as_mut() {
-            auth.stop();
-        }
-        if let Some(sup) = self.supervisor.as_mut() {
-            sup.interrupt(Some(&format!("thread-{}", self.active_session_idx)));
-        }
-        if let Some(s) = self.sessions.get_mut(self.active_session_idx) {
-            s.status = TurnStatus::Stopped;
+        if let Some(sess) = self.sessions.get_mut(self.active_session_idx) {
+            if let Some(auth) = sess.task.as_mut() {
+                auth.stop();
+            }
+            if let (Some(sup), Some(tid), Some(turn_id)) = (self.supervisor.as_mut(), &sess.thread_id, &sess.active_turn_id) {
+                sup.interrupt_turn(tid, turn_id);
+            }
+            sess.status = TurnStatus::Stopped;
         }
     }
 }
@@ -203,76 +220,178 @@ pub fn update_ai_runtime(app: &mut FigApp, ctx: &Context) {
                 }
                 app.ui.ai.harness_state = HarnessState::Ready;
             }
-            protocol::ProtocolEvent::TurnStarted { .. } => {
+            protocol::ProtocolEvent::ThreadStarted { thread_id } => {
+                // Associate thread_id to the session that initiated thread/start
+                let session_idx = app
+                    .ui
+                    .ai
+                    .sessions
+                    .iter()
+                    .position(|s| s.pending_turn_prompt.is_some() || s.thread_id.is_none())
+                    .unwrap_or(app.ui.ai.active_session_idx);
+
+                let pending_prompt = if let Some(sess) = app.ui.ai.sessions.get_mut(session_idx) {
+                    sess.thread_id = Some(thread_id.clone());
+                    sess.pending_turn_prompt.take()
+                } else {
+                    None
+                };
+
+                if let (Some(prompt), Some(sup)) = (pending_prompt, app.ui.ai.supervisor.as_mut()) {
+                    let sess_id = app.ui.ai.sessions.get(session_idx).map(|s| s.session_id.clone()).unwrap_or_default();
+                    sup.start_turn(&sess_id, &thread_id, &app.ui.ai.selected_model, &prompt, app.ui.ai.selected_effort.as_deref());
+                }
+            }
+            protocol::ProtocolEvent::TurnStarted { thread_id, turn_id } => {
                 app.ui.ai.is_running = true;
-                let active_idx = app.ui.ai.active_session_idx;
-                if let Some(sess) = app.ui.ai.sessions.get_mut(active_idx) {
+                let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
+                if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx) {
+                    sess.active_turn_id = Some(turn_id);
                     sess.status = TurnStatus::Running;
                     sess.ensure_assistant_turn();
                 }
             }
-            protocol::ProtocolEvent::AgentDelta { text } => {
-                let active_idx = app.ui.ai.active_session_idx;
-                if let Some(sess) = app.ui.ai.sessions.get_mut(active_idx) {
+            protocol::ProtocolEvent::AgentDelta { thread_id, turn_id: _, text } => {
+                let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
+                if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx).filter(|s| s.status == TurnStatus::Running) {
                     sess.append_assistant_delta(&text);
                 }
             }
-            protocol::ProtocolEvent::ItemStarted { item_id, tool_name } => {
-                let active_idx = app.ui.ai.active_session_idx;
-                if let (Some(sess), Some(name)) = (app.ui.ai.sessions.get_mut(active_idx), tool_name) {
-                    sess.append_tool_call(&item_id, &name, serde_json::Value::Null);
+            protocol::ProtocolEvent::ItemStarted { thread_id, turn_id: _, item_id, tool_name } => {
+                let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
+                if let (Some(sess), Some(name)) = (app.ui.ai.sessions.get_mut(sess_idx), tool_name) {
+                    sess.append_tool_call(&item_id, &name, Value::Null);
                 }
             }
-            protocol::ProtocolEvent::ItemCompleted { item_id, is_error, summary } => {
-                let active_idx = app.ui.ai.active_session_idx;
-                if let Some(sess) = app.ui.ai.sessions.get_mut(active_idx) {
+            protocol::ProtocolEvent::ItemCompleted { thread_id, turn_id: _, item_id, is_error, summary } => {
+                let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
+                if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx) {
                     let status = if is_error { ToolStatus::Failed } else { ToolStatus::Succeeded };
                     sess.update_tool_call(&item_id, status, summary);
                 }
             }
-            protocol::ProtocolEvent::ApprovalRequired { request_id, action, target } => {
-                let active_idx = app.ui.ai.active_session_idx;
-                if let Some(sess) = app.ui.ai.sessions.get_mut(active_idx) {
-                    sess.pending_approval = Some(PendingApproval { request_id, action, target });
+            protocol::ProtocolEvent::ApprovalRequired { thread_id, turn_id, request_id, action, target } => {
+                let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
+                if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx) {
+                    sess.pending_approval = Some(PendingApproval { thread_id, turn_id, request_id, action, target });
                     sess.status = TurnStatus::AwaitingApproval;
                 }
             }
-            protocol::ProtocolEvent::ToolCall { request_id, name, params } => {
-                let (status, summary, result_val) = if let Some(auth) = app.ui.ai.active_task.as_mut() {
-                    match auth.execute(&mut app.session, &name, &params) {
-                        Ok(res) => (ToolStatus::Succeeded, Some(format!("Applied {name}")), json!({ "status": "ok", "result": res })),
-                        Err(err) => (ToolStatus::Failed, Some(format!("Error: {err}")), json!({ "status": "error", "error": err.to_string() })),
-                    }
+            protocol::ProtocolEvent::ToolCall { thread_id, turn_id: _, call_id, request_id, name, params } => {
+                let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
+
+                let is_stopped = if let Some(sess) = app.ui.ai.sessions.get(sess_idx) {
+                    sess.status == TurnStatus::Stopped || sess.task.as_ref().map(|t| t.is_stopped()).unwrap_or(true)
                 } else {
-                    (ToolStatus::Failed, Some("TaskAuthority inactive".into()), json!({ "status": "error", "error": "TaskAuthority inactive" }))
+                    true
                 };
 
-                let active_idx = app.ui.ai.active_session_idx;
-                if let Some(sess) = app.ui.ai.sessions.get_mut(active_idx) {
-                    let call_id = request_id.as_str().unwrap_or("tool_call").to_string();
-                    sess.append_tool_call(&call_id, &name, params);
-                    sess.update_tool_call(&call_id, status, summary);
+                if is_stopped {
+                    if let Some(sup) = app.ui.ai.supervisor.as_mut() {
+                        sup.send_response(
+                            &request_id,
+                            json!({
+                                "success": false,
+                                "contentItems": [{
+                                    "type": "inputText",
+                                    "text": "Task was stopped: no further mutations admitted"
+                                }]
+                            }),
+                        );
+                    }
+                    continue;
+                }
+
+                let (status, summary, resp_val) = if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx) {
+                    if let Some(auth) = sess.task.as_mut() {
+                        match tools::execute_tool(&mut app.session, auth, &name, &params) {
+                            Ok(res) => {
+                                let res_str = serde_json::to_string(&res).unwrap_or_else(|_| "{}".to_string());
+                                (
+                                    ToolStatus::Succeeded,
+                                    Some(format!("Applied {name}")),
+                                    json!({
+                                        "success": true,
+                                        "contentItems": [{
+                                            "type": "inputText",
+                                            "text": res_str
+                                        }]
+                                    }),
+                                )
+                            }
+                            Err(err) => {
+                                let err_str = format!("Tool error: {err}");
+                                (
+                                    ToolStatus::Failed,
+                                    Some(err_str.clone()),
+                                    json!({
+                                        "success": false,
+                                        "contentItems": [{
+                                            "type": "inputText",
+                                            "text": err_str
+                                        }]
+                                    }),
+                                )
+                            }
+                        }
+                    } else {
+                        (
+                            ToolStatus::Failed,
+                            Some("TaskAuthority inactive".into()),
+                            json!({
+                                "success": false,
+                                "contentItems": [{
+                                    "type": "inputText",
+                                    "text": "TaskAuthority inactive"
+                                }]
+                            }),
+                        )
+                    }
+                } else {
+                    (
+                        ToolStatus::Failed,
+                        Some("Session not found".into()),
+                        json!({
+                            "success": false,
+                            "contentItems": [{
+                                "type": "inputText",
+                                "text": "Session not found"
+                            }]
+                        }),
+                    )
+                };
+
+                if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx) {
+                    let effective_call_id = if call_id.is_empty() { request_id.as_str().unwrap_or("tool_call").to_string() } else { call_id };
+                    sess.append_tool_call(&effective_call_id, &name, params);
+                    sess.update_tool_call(&effective_call_id, status, summary);
                 }
 
                 if let Some(sup) = app.ui.ai.supervisor.as_mut() {
-                    sup.send_response(&request_id, result_val);
+                    sup.send_response(&request_id, resp_val);
                 }
             }
-            protocol::ProtocolEvent::TurnCompleted { .. } => {
-                app.ui.ai.is_running = false;
-                let active_idx = app.ui.ai.active_session_idx;
-                if let Some(sess) = app.ui.ai.sessions.get_mut(active_idx) {
+            protocol::ProtocolEvent::TurnCompleted { thread_id, turn_id: _ } => {
+                let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
+                if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx) {
                     sess.status = TurnStatus::Completed;
+                    sess.active_turn_id = None;
                 }
-            }
-            protocol::ProtocolEvent::Error { message } => {
                 app.ui.ai.is_running = false;
-                let active_idx = app.ui.ai.active_session_idx;
-                if let Some(sess) = app.ui.ai.sessions.get_mut(active_idx) {
+            }
+            protocol::ProtocolEvent::Error { thread_id, message } => {
+                let sess_idx = find_session_by_thread(&app.ui.ai.sessions, thread_id.as_deref(), app.ui.ai.active_session_idx);
+                if let Some(sess) = app.ui.ai.sessions.get_mut(sess_idx) {
                     sess.append_assistant_message(&format!("Error: {message}"));
                     sess.status = TurnStatus::Failed;
+                    sess.active_turn_id = None;
                 }
+                app.ui.ai.is_running = false;
             }
         }
     }
+}
+
+fn find_session_by_thread(sessions: &[AiSession], thread_id: Option<&str>, default_idx: usize) -> usize {
+    if let Some(tid) = thread_id { sessions.iter().position(|s| s.thread_id.as_deref() == Some(tid)).unwrap_or(default_idx) } else { default_idx }
 }

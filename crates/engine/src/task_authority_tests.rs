@@ -146,3 +146,129 @@ fn stop_immediately_closes_admission_for_further_mutations() {
     let msg = res.unwrap_err().to_string();
     assert!(msg.contains("Task was stopped"), "Error message should state task was stopped: {msg}");
 }
+
+#[test]
+fn nested_batch_depth_and_count_limits_enforced() {
+    let mut s = Session::new();
+    let page_id = s.page().unwrap();
+    let doc_uid = s.ds().unwrap().uid;
+    let mut task = TaskAuthority::new("task-test-06", doc_uid, TaskScope::NewRoot { page_id, task_root: None });
+
+    // Deeply nested batch (depth > 3)
+    let deep_batch = json!({
+        "commands": [{
+            "command": "command.batch",
+            "params": {
+                "commands": [{
+                    "command": "command.batch",
+                    "params": {
+                        "commands": [{
+                            "command": "command.batch",
+                            "params": {
+                                "commands": [{
+                                    "command": "command.batch",
+                                    "params": {
+                                        "commands": [{"command": "frame.create", "params": {"x": 0, "y": 0, "width": 100, "height": 100}}]
+                                    }
+                                }]
+                            }
+                        }]
+                    }
+                }]
+            }
+        }]
+    });
+
+    let res = task.execute(&mut s, "command.batch", &deep_batch);
+    assert!(res.is_err());
+    let msg = res.unwrap_err().to_string();
+    assert!(msg.contains("maximum nesting depth"), "Expected nesting depth error: {msg}");
+
+    // Oversized batch (> 100 commands)
+    let mut commands = Vec::new();
+    for _ in 0..105 {
+        commands.push(json!({"command": "node.set", "params": {"id": 1, "props": {}}}));
+    }
+    let res_oversized = task.execute(&mut s, "command.batch", &json!({"commands": commands}));
+    assert!(res_oversized.is_err());
+    let msg_over = res_oversized.unwrap_err().to_string();
+    assert!(msg_over.contains("maximum limit of 100 commands"), "Expected command limit error: {msg_over}");
+}
+
+#[test]
+fn external_escapes_and_forbidden_commands_rejected() {
+    let mut s = Session::new();
+    let page_id = s.page().unwrap();
+    let doc_uid = s.ds().unwrap().uid;
+    let mut task = TaskAuthority::new("task-test-07", doc_uid, TaskScope::NewRoot { page_id, task_root: None });
+
+    let forbidden = [
+        "page.delete",
+        "page.create",
+        "edit.copy",
+        "edit.cut",
+        "edit.paste",
+        "collab.host",
+        "export.svg",
+        "plugin.install",
+        "clipboard.write",
+        "undo",
+        "redo",
+        "history.undo",
+    ];
+
+    for bad in forbidden {
+        let res = task.execute(&mut s, bad, &json!({}));
+        assert!(res.is_err(), "Expected command {bad} to be forbidden");
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("not permitted under design task scope"), "Expected permission error for {bad}: {msg}");
+    }
+}
+
+#[test]
+fn deleting_outside_scope_rejected_and_deleting_inside_recorded() {
+    let mut s = Session::new();
+    let page_id = s.page().unwrap();
+
+    let pre_sibling = id_of(&s.execute("frame.create", &json!({"x": 0, "y": 0, "width": 100, "height": 100, "name": "Pre Sibling"})).unwrap());
+    let target = id_of(&s.execute("frame.create", &json!({"x": 200, "y": 0, "width": 100, "height": 100, "name": "Target Root"})).unwrap());
+    let target_child = id_of(&s.execute("shape.rectangle", &json!({"parent": target.0, "x": 10, "y": 10, "width": 50, "height": 50})).unwrap());
+
+    let doc_uid = s.ds().unwrap().uid;
+    let mut task = TaskAuthority::new("task-test-08", doc_uid, TaskScope::Subtree { page_id, target_node: target });
+
+    // 1. Attempting to delete target_node itself must fail
+    let del_target = task.execute(&mut s, "edit.delete", &json!({"ids": [target.0]}));
+    assert!(del_target.is_err(), "Cannot delete authorized target node itself");
+    assert!(s.doc().unwrap().contains(target));
+
+    // 2. Attempting to delete pre_sibling outside subtree must fail
+    let del_sibling = task.execute(&mut s, "edit.delete", &json!({"ids": [pre_sibling.0]}));
+    assert!(del_sibling.is_err(), "Cannot delete node outside authorized subtree");
+    assert!(s.doc().unwrap().contains(pre_sibling));
+
+    // 3. Deleting target_child inside subtree must succeed and be tracked in deleted_nodes
+    let del_child = task.execute(&mut s, "edit.delete", &json!({"ids": [target_child.0]}));
+    assert!(del_child.is_ok(), "Deleting child inside subtree must succeed: {:?}", del_child);
+    assert!(!s.doc().unwrap().contains(target_child));
+    assert!(task.provenance().deleted_nodes.contains(&target_child));
+
+    // 4. Atomic rollback: if a batch deletes a valid child and then an invalid sibling, all deletes must roll back
+    let child_b = id_of(&s.execute("shape.rectangle", &json!({"parent": target.0, "x": 20, "y": 20, "width": 30, "height": 30})).unwrap());
+    let before_provenance = task.provenance().clone();
+
+    let atomic_fail = task.execute(
+        &mut s,
+        "command.batch",
+        &json!({
+            "commands": [
+                {"command": "edit.delete", "params": {"ids": [child_b.0]}},
+                {"command": "edit.delete", "params": {"ids": [pre_sibling.0]}}
+            ]
+        }),
+    );
+    assert!(atomic_fail.is_err());
+    assert!(s.doc().unwrap().contains(child_b), "child_b must be restored after rollback");
+    assert!(s.doc().unwrap().contains(pre_sibling), "pre_sibling must still exist");
+    assert_eq!(task.provenance().deleted_nodes, before_provenance.deleted_nodes, "Provenance deleted_nodes must be rolled back");
+}

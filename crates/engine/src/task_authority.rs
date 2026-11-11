@@ -32,6 +32,8 @@ pub struct TaskProvenance {
     pub created_nodes: BTreeSet<NodeId>,
     /// All existing node IDs modified by this task.
     pub modified_nodes: BTreeSet<NodeId>,
+    /// All node IDs deleted by this task.
+    pub deleted_nodes: BTreeSet<NodeId>,
     /// Initial properties before this task made changes, keyed by node ID.
     pub initial_properties: BTreeMap<NodeId, Value>,
     /// Chronological list of batch/command execution outcomes.
@@ -86,6 +88,17 @@ impl TaskAuthority {
         &self.provenance
     }
 
+    /// Check whether `node_id` is within this task's authorized scope.
+    pub fn is_in_scope(&self, doc: &Document, node_id: NodeId) -> bool {
+        match &self.scope {
+            TaskScope::NewRoot { page_id, task_root } => match task_root {
+                Some(root) => is_descendant_of(doc, node_id, *root),
+                None => node_id == *page_id,
+            },
+            TaskScope::Subtree { target_node, .. } => is_descendant_of(doc, node_id, *target_node),
+        }
+    }
+
     /// Execute a command under this task's authority and scope.
     pub fn execute(&mut self, session: &mut Session, cmd_id: &str, params: &Value) -> Result<Value> {
         if self.stopped {
@@ -100,39 +113,88 @@ impl TaskAuthority {
             )));
         }
 
-        Self::verify_allowed_command(cmd_id, params)?;
-
         let before_doc = session.ds()?.doc.clone();
+        let before_selection = session.ds()?.selection.clone();
         let before_history = session.ds()?.history.undo.len();
+        let backup_scope = self.scope.clone();
+        let backup_provenance = self.provenance.clone();
 
-        let res_value = session.execute_as(Some(&self.task_id), cmd_id, params)?;
+        let mut run_mutation = || -> Result<Value> {
+            Self::verify_allowed_command(cmd_id, params)?;
 
-        let after_doc = session.ds()?.doc.clone();
-        let changed = after_doc.changed_ids(&before_doc, usize::MAX).unwrap_or_default();
+            let res_value = session.execute_as(Some(&self.task_id), cmd_id, params)?;
 
-        if let Err(scope_err) = self.validate_and_record_scope(&before_doc, &after_doc, &changed, cmd_id) {
-            // Roll back document and undo history
-            if let Ok(ds) = session.ds_mut() {
-                ds.doc = before_doc;
-                ds.history.undo.truncate(before_history);
+            let after_doc = session.ds()?.doc.clone();
+            let changed = after_doc.changed_ids(&before_doc, usize::MAX).unwrap_or_default();
+
+            self.validate_and_record_scope(&before_doc, &after_doc, &changed, cmd_id)?;
+            Ok(res_value)
+        };
+
+        match run_mutation() {
+            Ok(val) => Ok(val),
+            Err(err) => {
+                // Atomic rollback of session document, selection, undo history, and task authority state
+                if let Ok(ds) = session.ds_mut() {
+                    ds.doc = before_doc;
+                    ds.selection = before_selection;
+                    ds.history.undo.truncate(before_history);
+                }
+                self.scope = backup_scope;
+                self.provenance = backup_provenance;
+                Err(err)
             }
-            return Err(scope_err);
         }
-
-        Ok(res_value)
     }
 
     fn verify_allowed_command(cmd_id: &str, params: &Value) -> Result<()> {
+        let mut total_count = 0;
+        Self::verify_allowed_command_recursive(cmd_id, params, 0, &mut total_count)
+    }
+
+    fn verify_allowed_command_recursive(cmd_id: &str, params: &Value, depth: usize, total_count: &mut usize) -> Result<()> {
+        if depth > 3 {
+            return Err(EngineError::Other("Command batch exceeds maximum nesting depth of 3".into()));
+        }
+        *total_count += 1;
+        if *total_count > 100 {
+            return Err(EngineError::Other("Command batch exceeds maximum limit of 100 commands".into()));
+        }
+
+        // Explicit blocklist: reject system, external, global, clipboard and history escaping commands
+        if cmd_id.starts_with("file.")
+            || cmd_id.starts_with("app.")
+            || cmd_id.starts_with("collab.")
+            || cmd_id.starts_with("export.")
+            || cmd_id.starts_with("plugin.")
+            || cmd_id.starts_with("clipboard.")
+            || cmd_id.starts_with("view.")
+            || cmd_id.starts_with("history.")
+            || cmd_id.starts_with("system.")
+            || cmd_id.starts_with("pref.")
+            || cmd_id.starts_with("dev.")
+            || cmd_id.starts_with("page.")
+            || cmd_id == "undo"
+            || cmd_id == "redo"
+            || cmd_id == "edit.copy"
+            || cmd_id == "edit.cut"
+            || cmd_id == "edit.paste"
+        {
+            return Err(EngineError::Other(format!("Command `{cmd_id}` is not permitted under design task scope")));
+        }
+
         if cmd_id == "command.batch" {
-            if let Some(commands) = params.get("commands").and_then(Value::as_array) {
-                for c in commands {
-                    if let Some(inner_cmd) = c.get("command").and_then(Value::as_str) {
-                        let inner_params = c.get("params").unwrap_or(&Value::Null);
-                        Self::verify_allowed_command(inner_cmd, inner_params)?;
-                    } else {
-                        return Err(EngineError::Other("Malformed batch: command item missing command string".into()));
-                    }
-                }
+            let commands = params
+                .get("commands")
+                .and_then(Value::as_array)
+                .ok_or_else(|| EngineError::Other("Malformed batch: command.batch missing commands array".into()))?;
+            for c in commands {
+                let inner_cmd = c
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| EngineError::Other("Malformed batch: command item missing command string".into()))?;
+                let inner_params = c.get("params").unwrap_or(&Value::Null);
+                Self::verify_allowed_command_recursive(inner_cmd, inner_params, depth + 1, total_count)?;
             }
             return Ok(());
         }
@@ -147,7 +209,11 @@ impl TaskAuthority {
             || cmd_id.starts_with("align.")
             || cmd_id.starts_with("distribute.")
             || cmd_id.starts_with("vector.")
-            || cmd_id.starts_with("boolean.");
+            || cmd_id.starts_with("boolean.")
+            || cmd_id.starts_with("group.")
+            || cmd_id.starts_with("style.")
+            || cmd_id == "edit.delete"
+            || cmd_id == "edit.duplicate";
 
         if !allowed {
             return Err(EngineError::Other(format!("Command `{cmd_id}` is not permitted under design task scope")));
@@ -183,6 +249,13 @@ impl TaskAuthority {
                         if ch_id == pid {
                             continue;
                         }
+                        if !after_doc.contains(ch_id) {
+                            *task_root = None;
+                            return Err(EngineError::Other(format!(
+                                "Mutation out of scope: cannot delete node {} while establishing task root",
+                                ch_id.0
+                            )));
+                        }
                         if ch_id != new_root && !is_descendant_of(after_doc, ch_id, new_root) {
                             *task_root = None;
                             return Err(EngineError::Other(format!(
@@ -209,6 +282,25 @@ impl TaskAuthority {
                         if ch_id == pid {
                             continue;
                         }
+
+                        if before_doc.contains(ch_id) && !after_doc.contains(ch_id) {
+                            // Deletion check
+                            if ch_id == root {
+                                return Err(EngineError::Other(format!("Mutation out of scope: cannot delete established task root {}", root.0)));
+                            }
+                            if !self.provenance.created_nodes.contains(&ch_id) {
+                                return Err(EngineError::Other(format!(
+                                    "Mutation out of scope: cannot delete node {} outside task creation ownership",
+                                    ch_id.0
+                                )));
+                            }
+                            self.provenance.deleted_nodes.insert(ch_id);
+                            self.provenance.created_nodes.remove(&ch_id);
+                            self.provenance.modified_nodes.remove(&ch_id);
+                            affected.push(ch_id);
+                            continue;
+                        }
+
                         if ch_id != root && !is_descendant_of(after_doc, ch_id, root) {
                             return Err(EngineError::Other(format!("Mutation out of scope: node {} is outside task-owned root {}", ch_id.0, root.0)));
                         }
@@ -224,6 +316,24 @@ impl TaskAuthority {
             TaskScope::Subtree { target_node, .. } => {
                 let target = *target_node;
                 for &ch_id in changed {
+                    if before_doc.contains(ch_id) && !after_doc.contains(ch_id) {
+                        // Deletion check
+                        if ch_id == target {
+                            return Err(EngineError::Other(format!("Mutation out of scope: cannot delete authorized target node {}", target.0)));
+                        }
+                        if !is_descendant_of(before_doc, ch_id, target) {
+                            return Err(EngineError::Other(format!(
+                                "Mutation out of scope: cannot delete node {} outside authorized subtree {}",
+                                ch_id.0, target.0
+                            )));
+                        }
+                        self.provenance.deleted_nodes.insert(ch_id);
+                        self.provenance.created_nodes.remove(&ch_id);
+                        self.provenance.modified_nodes.remove(&ch_id);
+                        affected.push(ch_id);
+                        continue;
+                    }
+
                     if ch_id != target && !is_descendant_of(after_doc, ch_id, target) {
                         return Err(EngineError::Other(format!(
                             "Mutation out of scope: node {} is outside authorized target subtree {}",

@@ -42,6 +42,8 @@ pub struct ToolCallInfo {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingApproval {
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
     pub request_id: Value,
     pub action: String,
     pub target: String,
@@ -90,6 +92,8 @@ pub struct DraftAttachment {
 pub struct AiSession {
     pub session_id: String,
     pub thread_id: Option<String>,
+    pub active_turn_id: Option<String>,
+    pub pending_turn_prompt: Option<String>,
     pub title: String,
     pub created_at: String,
     pub doc_uid: u64,
@@ -100,6 +104,8 @@ pub struct AiSession {
     pub status: TurnStatus,
     pub status_message: Option<String>,
     pub retained_edits: Vec<NodeId>,
+    #[serde(skip)]
+    pub task: Option<figcraft_engine::TaskAuthority>,
 }
 
 impl AiSession {
@@ -107,6 +113,8 @@ impl AiSession {
         Self {
             session_id: session_id.into(),
             thread_id: None,
+            active_turn_id: None,
+            pending_turn_prompt: None,
             title: "New Conversation".into(),
             created_at: "Just now".into(),
             doc_uid,
@@ -117,6 +125,7 @@ impl AiSession {
             status: TurnStatus::Idle,
             status_message: None,
             retained_edits: Vec::new(),
+            task: None,
         }
     }
 

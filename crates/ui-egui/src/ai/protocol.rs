@@ -31,14 +31,15 @@ pub enum ServerMessage {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
     Initialized { models: Vec<String>, account_email: Option<String>, plan_type: Option<String> },
-    AgentDelta { text: String },
-    ItemStarted { item_id: String, tool_name: Option<String> },
-    ItemCompleted { item_id: String, is_error: bool, summary: Option<String> },
-    TurnStarted { turn_id: String },
-    TurnCompleted { turn_id: Option<String> },
-    ApprovalRequired { request_id: Value, action: String, target: String },
-    ToolCall { request_id: Value, name: String, params: Value },
-    Error { message: String },
+    ThreadStarted { thread_id: String },
+    TurnStarted { thread_id: Option<String>, turn_id: String },
+    TurnCompleted { thread_id: Option<String>, turn_id: Option<String> },
+    AgentDelta { thread_id: Option<String>, turn_id: Option<String>, text: String },
+    ItemStarted { thread_id: Option<String>, turn_id: Option<String>, item_id: String, tool_name: Option<String> },
+    ItemCompleted { thread_id: Option<String>, turn_id: Option<String>, item_id: String, is_error: bool, summary: Option<String> },
+    ApprovalRequired { thread_id: Option<String>, turn_id: Option<String>, request_id: Value, action: String, target: String },
+    ToolCall { thread_id: Option<String>, turn_id: Option<String>, call_id: String, request_id: Value, name: String, params: Value },
+    Error { thread_id: Option<String>, message: String },
 }
 
 /// Parse a raw incoming line from the app-server.
@@ -76,51 +77,82 @@ pub fn parse_message_line(line: &str) -> Result<ServerMessage, String> {
 /// Convert a ServerMessage into a high-level ProtocolEvent if applicable.
 pub fn message_to_event(msg: &ServerMessage) -> Option<ProtocolEvent> {
     match msg {
-        ServerMessage::Notification { method, params } => match method.as_str() {
-            "item/agentMessage/delta" => {
-                let delta = params.get("delta").and_then(Value::as_str)?;
-                Some(ProtocolEvent::AgentDelta { text: delta.to_string() })
+        ServerMessage::Notification { method, params } => {
+            let thread_id = params.get("threadId").and_then(Value::as_str).map(|s| s.to_string());
+            match method.as_str() {
+                "thread/started" => {
+                    let tid = params
+                        .get("thread")
+                        .and_then(|t| t.get("id"))
+                        .and_then(Value::as_str)
+                        .or_else(|| params.get("threadId").and_then(Value::as_str))?
+                        .to_string();
+                    Some(ProtocolEvent::ThreadStarted { thread_id: tid })
+                }
+                "turn/started" => {
+                    let turn_id = params
+                        .get("turn")
+                        .and_then(|t| t.get("id"))
+                        .and_then(Value::as_str)
+                        .or_else(|| params.get("turnId").and_then(Value::as_str))
+                        .unwrap_or("")
+                        .to_string();
+                    Some(ProtocolEvent::TurnStarted { thread_id, turn_id })
+                }
+                "turn/completed" => {
+                    let turn_id = params
+                        .get("turn")
+                        .and_then(|t| t.get("id"))
+                        .and_then(Value::as_str)
+                        .or_else(|| params.get("turnId").and_then(Value::as_str))
+                        .map(|s| s.to_string());
+                    Some(ProtocolEvent::TurnCompleted { thread_id, turn_id })
+                }
+                "item/agentMessage/delta" => {
+                    let delta = params.get("delta").and_then(Value::as_str)?;
+                    let turn_id = params.get("turnId").and_then(Value::as_str).map(|s| s.to_string());
+                    Some(ProtocolEvent::AgentDelta { thread_id, turn_id, text: delta.to_string() })
+                }
+                "item/started" => {
+                    let item = params.get("item")?;
+                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let tool_name = item.get("name").and_then(Value::as_str).map(|s| s.to_string());
+                    let turn_id = params.get("turnId").and_then(Value::as_str).map(|s| s.to_string());
+                    Some(ProtocolEvent::ItemStarted { thread_id, turn_id, item_id, tool_name })
+                }
+                "item/completed" => {
+                    let item = params.get("item")?;
+                    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let is_error = item.get("status").and_then(Value::as_str) == Some("failed");
+                    let summary = item.get("summary").and_then(Value::as_str).map(|s| s.to_string());
+                    let turn_id = params.get("turnId").and_then(Value::as_str).map(|s| s.to_string());
+                    Some(ProtocolEvent::ItemCompleted { thread_id, turn_id, item_id, is_error, summary })
+                }
+                "error" => {
+                    let text = params.get("message").and_then(Value::as_str).unwrap_or("unknown server error");
+                    Some(ProtocolEvent::Error { thread_id, message: text.to_string() })
+                }
+                _ => None,
             }
-            "item/started" => {
-                let item = params.get("item")?;
-                let item_id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                let tool_name = item.get("name").and_then(Value::as_str).map(|s| s.to_string());
-                Some(ProtocolEvent::ItemStarted { item_id, tool_name })
+        }
+        ServerMessage::Request { id, method, params } => {
+            let thread_id = params.get("threadId").and_then(Value::as_str).map(|s| s.to_string());
+            let turn_id = params.get("turnId").and_then(Value::as_str).map(|s| s.to_string());
+            match method.as_str() {
+                "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "item/permissions/requestApproval" => {
+                    let action = params.get("action").and_then(Value::as_str).unwrap_or("permission request").to_string();
+                    let target = params.get("target").or_else(|| params.get("command")).and_then(Value::as_str).unwrap_or("").to_string();
+                    Some(ProtocolEvent::ApprovalRequired { thread_id, turn_id, request_id: id.clone(), action, target })
+                }
+                "item/tool/call" => {
+                    let call_id = params.get("callId").and_then(Value::as_str).unwrap_or("").to_string();
+                    let name = params.get("tool").or_else(|| params.get("name")).and_then(Value::as_str).unwrap_or("").to_string();
+                    let tool_params = params.get("arguments").or_else(|| params.get("parameters")).cloned().unwrap_or(Value::Null);
+                    Some(ProtocolEvent::ToolCall { thread_id, turn_id, call_id, request_id: id.clone(), name, params: tool_params })
+                }
+                _ => None,
             }
-            "item/completed" => {
-                let item = params.get("item")?;
-                let item_id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-                let is_error = item.get("status").and_then(Value::as_str) == Some("failed");
-                let summary = item.get("summary").and_then(Value::as_str).map(|s| s.to_string());
-                Some(ProtocolEvent::ItemCompleted { item_id, is_error, summary })
-            }
-            "turn/started" => {
-                let turn_id = params.get("turnId").and_then(Value::as_str).unwrap_or("").to_string();
-                Some(ProtocolEvent::TurnStarted { turn_id })
-            }
-            "turn/completed" => {
-                let turn_id = params.get("turnId").and_then(Value::as_str).map(|s| s.to_string());
-                Some(ProtocolEvent::TurnCompleted { turn_id })
-            }
-            "error" => {
-                let text = params.get("message").and_then(Value::as_str).unwrap_or("unknown server error");
-                Some(ProtocolEvent::Error { message: text.to_string() })
-            }
-            _ => None,
-        },
-        ServerMessage::Request { id, method, params } => match method.as_str() {
-            "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "item/permissions/requestApproval" => {
-                let action = params.get("action").and_then(Value::as_str).unwrap_or("permission request").to_string();
-                let target = params.get("target").or_else(|| params.get("command")).and_then(Value::as_str).unwrap_or("").to_string();
-                Some(ProtocolEvent::ApprovalRequired { request_id: id.clone(), action, target })
-            }
-            "item/tool/call" => {
-                let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
-                let tool_params = params.get("parameters").cloned().unwrap_or(Value::Null);
-                Some(ProtocolEvent::ToolCall { request_id: id.clone(), name, params: tool_params })
-            }
-            _ => None,
-        },
+        }
         ServerMessage::Response { .. } => None,
     }
 }
@@ -136,12 +168,52 @@ pub fn format_request(id: u64, method: &str, params: Value) -> String {
     .to_string()
 }
 
-/// Create a Client Response line to an app-server approval or tool call.
+/// Create a Client Notification line formatted as JSON-RPC 2.0.
+pub fn format_notification(method: &str, params: Value) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params
+    })
+    .to_string()
+}
+
+/// Create a Client Response line to an app-server request.
 pub fn format_response(id: &Value, result: Value) -> String {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": result
+    })
+    .to_string()
+}
+
+/// Format a DynamicToolCallResponse compliant with Codex app-server schema.
+pub fn format_dynamic_tool_response(id: &Value, success: bool, text_content: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "success": success,
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": text_content
+                }
+            ]
+        }
+    })
+    .to_string()
+}
+
+/// Format an ApprovalResponse compliant with Codex app-server schema.
+pub fn format_approval_response(id: &Value, allow: bool) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "decision": if allow { "allow" } else { "deny" }
+        }
     })
     .to_string()
 }
