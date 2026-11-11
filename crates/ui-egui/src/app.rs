@@ -342,6 +342,7 @@ impl FigApp {
                 .show(ui, |ui| {
                     let label = match self.ui.left_tab {
                         _ if self.ui.versions.open => i18n::tr("Version history"),
+                        LeftTab::AiChat => i18n::tr("AI Chat"),
                         LeftTab::File => i18n::tr("Layers"),
                         LeftTab::Assets => i18n::tr("Assets"),
                     };

@@ -105,6 +105,7 @@ mod doc_state;
 mod error;
 mod prefs;
 mod session;
+pub mod task_authority;
 mod view_state;
 
 pub use derived::{changed_nodes, normalize};
@@ -112,6 +113,7 @@ pub use doc_state::{DocState, History, HistoryEntry, Interaction, PREVIEW_READ_O
 pub use error::{EngineError, Result, bad};
 pub use prefs::{Clipboard, DefaultProps, MAX_RECENT_ACTIONS, Prefs, UI_SCALE_MAX, UI_SCALE_MIN, UI_SCALE_SIZES, UiRequest, clamp_ui_scale};
 pub use session::Forward;
+pub use task_authority::{TaskAuthority, TaskEditGroup, TaskProvenance, TaskScope};
 pub use view_state::ViewState;
 
 /// The editing session: open documents, the current tool, clipboard and prefs.
@@ -574,6 +576,8 @@ mod styles_behaviour_tests;
 mod svg_import_tests;
 #[cfg(test)]
 mod tailwind_tests;
+#[cfg(test)]
+mod task_authority_tests;
 #[cfg(test)]
 mod templates_tests;
 #[cfg(test)]
