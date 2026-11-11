@@ -1156,7 +1156,33 @@ fn ui_set_view(app: &mut FigApp, ctx: &Context, p: &Value) -> Result<(), String>
         };
     }
     if let Some(t) = p.get("leftTab").and_then(Value::as_str) {
-        app.ui.left_tab = if t == "assets" { crate::LeftTab::Assets } else { crate::LeftTab::File };
+        app.ui.left_tab = match t {
+            "ai" | "aiChat" | "AiChat" => {
+                app.ui.open_left_panel();
+                crate::LeftTab::AiChat
+            }
+            "assets" | "Assets" => crate::LeftTab::Assets,
+            _ => crate::LeftTab::File,
+        };
+    }
+    if let Some(m) = p.get("aiModel").and_then(Value::as_str) {
+        app.ui.ai.selected_model = m.to_string();
+    }
+    if let Some(draft) = p.get("aiDraft").and_then(Value::as_str) {
+        app.ui.ai.draft_text = draft.to_string();
+    }
+    if let Some(submit) = p.get("aiSubmit").and_then(Value::as_bool)
+        && submit
+        && !app.ui.ai.draft_text.trim().is_empty()
+    {
+        app.ui.left_tab = crate::LeftTab::AiChat;
+        app.ui.open_left_panel();
+        app.ui.ai.submit_turn(&mut app.session);
+    }
+    if let Some(stop) = p.get("aiStop").and_then(Value::as_bool)
+        && stop
+    {
+        app.ui.ai.stop_active_task();
     }
     if let Some(t) = p.get("theme").and_then(Value::as_str) {
         app.session.prefs.theme = t.to_string();

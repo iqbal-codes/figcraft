@@ -55,13 +55,14 @@ pub fn show(app: &mut FigApp, ui: &mut Ui) {
     // Lower bar: Model chip on left, Stop or Send on right
     let bar_y = comp_rect.max.y - 28.0;
     let model_rect = Rect::from_min_size(pos2(comp_rect.min.x + 8.0, bar_y), vec2(80.0, 22.0));
-    let model_text = if app.ui.ai.selected_model.is_empty() { "gpt-5.6-sol" } else { &app.ui.ai.selected_model };
+    let model_text = if app.ui.ai.selected_model.is_empty() { "gpt-6-luna" } else { &app.ui.ai.selected_model };
     ui.painter().text(pos2(model_rect.min.x, model_rect.center().y), Align2::LEFT_CENTER, model_text, regular(10.0), t.text_secondary);
 
     if is_running {
         // Stop button
         let stop_rect = Rect::from_min_size(pos2(comp_rect.max.x - 68.0, bar_y), vec2(60.0, 22.0));
         let stop_resp = ui.interact(stop_rect, ui.scope_id().with("ai_composer_stop"), Sense::click());
+        stop_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, false, tr("Stop")));
         let fill = if stop_resp.hovered() { t.danger.gamma_multiply(0.15) } else { t.hover };
         ui.painter().rect_filled(stop_rect, CornerRadius::same(4), fill);
         ui.painter().text(stop_rect.center(), Align2::CENTER_CENTER, tr("Stop"), semibold(11.0), t.danger);
@@ -73,6 +74,7 @@ pub fn show(app: &mut FigApp, ui: &mut Ui) {
         let can_send = !app.ui.ai.draft_text.trim().is_empty();
         let send_rect = Rect::from_min_size(pos2(comp_rect.max.x - 68.0, bar_y), vec2(60.0, 22.0));
         let send_resp = ui.interact(send_rect, ui.scope_id().with("ai_composer_send"), if can_send { Sense::click() } else { Sense::hover() });
+        send_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, false, tr("Send")));
         let fill = if can_send && send_resp.hovered() {
             t.accent
         } else if can_send {
@@ -99,6 +101,7 @@ pub fn render_rail_stop(app: &mut FigApp, ui: &mut Ui, r: Rect) {
     let t = Tokens::get(ui.ctx());
     let stop_rect = Rect::from_center_size(pos2(r.center().x, r.max.y - 30.0), vec2(36.0, 24.0));
     let stop_resp = ui.interact(stop_rect, ui.scope_id().with("ai_rail_stop"), Sense::click());
+    stop_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, false, tr("Stop")));
     let fill = if stop_resp.hovered() { t.danger.gamma_multiply(0.15) } else { t.hover };
     ui.painter().rect_filled(stop_rect, CornerRadius::same(4), fill);
     ui.painter().text(stop_rect.center(), Align2::CENTER_CENTER, tr("Stop"), semibold(10.0), t.danger);

@@ -38,6 +38,7 @@ fn show_conversation_view(app: &mut FigApp, ui: &mut Ui) {
     // Sessions history button on left
     let sess_btn = Rect::from_min_size(pos2(head.min.x + 8.0, head.min.y + 6.0), vec2(70.0, 24.0));
     let sess_resp = ui.interact(sess_btn, ui.scope_id().with("ai_sessions_btn"), Sense::click());
+    sess_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, false, tr("Sessions ▾")));
     if sess_resp.hovered() {
         ui.painter().rect_filled(sess_btn, CornerRadius::same(4), t.hover);
     }
@@ -47,9 +48,10 @@ fn show_conversation_view(app: &mut FigApp, ui: &mut Ui) {
     }
 
     // Model name / status on right
-    let model_text = if app.ui.ai.selected_model.is_empty() { "gpt-5.6-sol" } else { &app.ui.ai.selected_model };
+    let model_text = if app.ui.ai.selected_model.is_empty() { "gpt-6-luna" } else { &app.ui.ai.selected_model };
     let model_btn = Rect::from_min_size(pos2(head.max.x - 90.0, head.min.y + 6.0), vec2(82.0, 24.0));
     let model_resp = ui.interact(model_btn, ui.scope_id().with("ai_model_picker"), Sense::click());
+    model_resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, false, format!("Model: {model_text}")));
     if model_resp.hovered() {
         ui.painter().rect_filled(model_btn, CornerRadius::same(4), t.hover);
     }
@@ -76,7 +78,7 @@ fn show_conversation_view(app: &mut FigApp, ui: &mut Ui) {
 
 fn render_messages(app: &mut FigApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
-    let w = ui.available_width();
+    let _w = ui.available_width();
 
     let session_idx = app.ui.ai.active_session_idx;
     let Some(session) = app.ui.ai.sessions.get(session_idx) else {
@@ -104,70 +106,78 @@ fn render_messages(app: &mut FigApp, ui: &mut Ui) {
 
     let mut pending_reply: Option<(serde_json::Value, bool)> = None;
 
-    for msg in &session.messages {
-        match msg.role {
-            MessageRole::User => {
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    let bubble_w = (w - 32.0).max(100.0);
-                    let frame = egui::Frame::NONE.fill(t.hover).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(8));
-                    frame.show(ui, |ui| {
-                        ui.set_width(bubble_w);
-                        ui.label(egui::RichText::new(&msg.text).font(regular(12.0)).color(t.text));
-                    });
-                });
-                ui.add_space(8.0);
-            }
-            MessageRole::Assistant => {
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.set_width(w - 16.0);
-                        ui.label(egui::RichText::new(&msg.text).font(regular(12.0)).color(t.text));
-                    });
-                });
-                ui.add_space(8.0);
-            }
-            MessageRole::Tool => {
-                if let Some(tool) = &msg.tool_call {
+    ui.scope(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+
+        for msg in &session.messages {
+            match msg.role {
+                MessageRole::User => {
+                    let bubble_w = (ui.available_width() - 24.0).max(80.0);
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
-                        let frame = egui::Frame::NONE
-                            .fill(t.selected_row)
-                            .stroke(Stroke::new(1.0, t.border))
-                            .corner_radius(CornerRadius::same(4))
-                            .inner_margin(egui::Margin::symmetric(8, 6));
+                        let frame = egui::Frame::NONE.fill(t.hover).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(8));
                         frame.show(ui, |ui| {
-                            ui.set_width(w - 24.0);
-                            let status_str = match tool.status {
-                                ToolStatus::Queued => tr("queued"),
-                                ToolStatus::Running => tr("running…"),
-                                ToolStatus::Succeeded => tr("✓ done"),
-                                ToolStatus::Failed => tr("✗ failed"),
-                            };
-                            let status_color = match tool.status {
-                                ToolStatus::Succeeded => t.accent_text,
-                                ToolStatus::Failed => t.danger,
-                                _ => t.text_secondary,
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(&tool.tool_name).font(semibold(11.0)).color(t.text));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(egui::RichText::new(status_str).font(regular(10.0)).color(status_color));
-                                });
-                            });
-                            if let Some(summary) = &tool.result_summary {
-                                ui.add_space(2.0);
-                                ui.label(egui::RichText::new(summary).font(regular(10.0)).color(t.text_secondary));
-                            }
+                            ui.set_max_width(bubble_w);
+                            ui.add(egui::Label::new(egui::RichText::new(&msg.text).font(regular(12.0)).color(t.text)).wrap());
                         });
                     });
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
                 }
+                MessageRole::Assistant => {
+                    let avail = (ui.available_width() - 16.0).max(80.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(avail);
+                            ui.add(egui::Label::new(egui::RichText::new(&msg.text).font(regular(12.0)).color(t.text)).wrap());
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
+                MessageRole::Tool => {
+                    if let Some(tool) = &msg.tool_call {
+                        let row_w = (ui.available_width() - 20.0).max(80.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            let frame = egui::Frame::NONE
+                                .fill(t.selected_row)
+                                .stroke(Stroke::new(1.0, t.border))
+                                .corner_radius(CornerRadius::same(4))
+                                .inner_margin(egui::Margin::symmetric(8, 6));
+                            frame.show(ui, |ui| {
+                                ui.set_max_width(row_w);
+                                let status_str = match tool.status {
+                                    ToolStatus::Queued => tr("queued"),
+                                    ToolStatus::Running => tr("running…"),
+                                    ToolStatus::Succeeded => tr("done"),
+                                    ToolStatus::Failed => tr("failed"),
+                                };
+                                let status_color = match tool.status {
+                                    ToolStatus::Succeeded => t.accent_text,
+                                    ToolStatus::Failed => t.danger,
+                                    _ => t.text_secondary,
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(&tool.tool_name).font(semibold(11.0)).color(t.text));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new(status_str).font(regular(10.0)).color(status_color));
+                                        let (dot_rect, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+                                        ui.painter().circle_filled(dot_rect.center(), 2.5, status_color);
+                                    });
+                                });
+                                if let Some(summary) = &tool.result_summary {
+                                    ui.add_space(2.0);
+                                    ui.add(egui::Label::new(egui::RichText::new(summary).font(regular(10.0)).color(t.text_secondary)).wrap());
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                }
+                MessageRole::System => {}
             }
-            MessageRole::System => {}
         }
-    }
+    });
 
     // Pending approval card if required
     if let Some(approval) = &session.pending_approval {

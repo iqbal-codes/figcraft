@@ -160,6 +160,250 @@ pub fn canvas_tool_specs() -> Vec<Value> {
     ]
 }
 
+fn convert_font_weight(v: &Value) -> Option<Value> {
+    match v {
+        Value::Number(_) => Some(v.clone()),
+        Value::String(s) => {
+            if let Ok(num) = s.parse::<f64>() {
+                Some(json!(num))
+            } else {
+                match s.to_lowercase().as_str() {
+                    "thin" => Some(json!(100.0)),
+                    "extralight" | "extra-light" => Some(json!(200.0)),
+                    "light" => Some(json!(300.0)),
+                    "regular" | "normal" => Some(json!(400.0)),
+                    "medium" => Some(json!(500.0)),
+                    "semibold" | "semi-bold" => Some(json!(600.0)),
+                    "bold" => Some(json!(700.0)),
+                    "extrabold" | "extra-bold" => Some(json!(800.0)),
+                    "black" => Some(json!(900.0)),
+                    _ => None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+fn execute_create_frame(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
+    let mut p = params.clone();
+    if let Some(obj) = p.as_object_mut()
+        && !obj.contains_key("parent")
+    {
+        let page_id = match auth.scope() {
+            TaskScope::NewRoot { page_id, .. } => *page_id,
+            TaskScope::Subtree { page_id, .. } => *page_id,
+        };
+        obj.insert("parent".into(), json!(page_id.0));
+    }
+    auth.execute(session, "frame.create", &p)
+}
+
+fn execute_create_text(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
+    let mut p = params.clone();
+    if let Some(obj) = p.as_object_mut() {
+        if !obj.contains_key("text")
+            && let Some(c) = obj.get("characters").cloned()
+        {
+            obj.insert("text".into(), c);
+        }
+        if !obj.contains_key("parent") {
+            let default_parent = match auth.scope() {
+                TaskScope::NewRoot { task_root, page_id } => task_root.unwrap_or(*page_id),
+                TaskScope::Subtree { target_node, .. } => *target_node,
+            };
+            obj.insert("parent".into(), json!(default_parent.0));
+        }
+        let mut props = obj.get("props").and_then(Value::as_object).cloned().unwrap_or_default();
+        for key in
+            ["fontSize", "fontFamily", "fontWeight", "fontStyle", "color", "fill", "fills", "letterSpacing", "lineHeight", "textAlign", "align"]
+        {
+            if let Some(v) = obj.remove(key) {
+                let prop_key = match key {
+                    "align" => "textAlign",
+                    "color" => "fill",
+                    other => other,
+                };
+                if prop_key == "fontWeight" {
+                    if let Some(w) = convert_font_weight(&v) {
+                        props.insert("fontWeight".into(), w);
+                    }
+                } else {
+                    props.insert(prop_key.into(), v);
+                }
+            }
+        }
+        if !props.is_empty() {
+            obj.insert("props".into(), Value::Object(props));
+        }
+    }
+    auth.execute(session, "text.create", &p)
+}
+
+fn execute_create_shape(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
+    let kind = params.get("kind").and_then(Value::as_str).unwrap_or("rectangle");
+    let cmd = if kind == "ellipse" { "shape.ellipse" } else { "shape.rectangle" };
+    let mut p = params.clone();
+    if let Some(obj) = p.as_object_mut() {
+        obj.remove("kind");
+        if !obj.contains_key("parent") {
+            let default_parent = match auth.scope() {
+                TaskScope::NewRoot { task_root, page_id } => task_root.unwrap_or(*page_id),
+                TaskScope::Subtree { target_node, .. } => *target_node,
+            };
+            obj.insert("parent".into(), json!(default_parent.0));
+        }
+    }
+    auth.execute(session, cmd, &p)
+}
+
+fn execute_set_layout(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
+    let id = params.get("id").and_then(Value::as_u64).ok_or_else(|| EngineError::Other("canvas_set_layout requires `id` integer".into()))?;
+    let mut props = serde_json::Map::new();
+    if let Some(mode) = params.get("mode").and_then(Value::as_str) {
+        props.insert("layout".into(), json!(mode));
+    }
+    if let Some(gap) = params.get("gap") {
+        props.insert("gap".into(), gap.clone());
+    }
+    if let Some(cg) = params.get("crossGap") {
+        props.insert("crossGap".into(), cg.clone());
+    }
+    if let Some(pad) = params.get("padding") {
+        props.insert("padding".into(), pad.clone());
+    }
+    if let Some(ma) = params.get("mainAlign") {
+        props.insert("mainAlign".into(), ma.clone());
+    }
+    if let Some(ca) = params.get("crossAlign") {
+        props.insert("crossAlign".into(), ca.clone());
+    }
+    if let Some(wrap) = params.get("wrap") {
+        props.insert("wrap".into(), wrap.clone());
+    }
+    if let Some(sh) = params.get("sizingH") {
+        props.insert("sizingH".into(), sh.clone());
+    }
+    if let Some(sv) = params.get("sizingV") {
+        props.insert("sizingV".into(), sv.clone());
+    }
+    let payload = json!({
+        "id": id,
+        "props": Value::Object(props)
+    });
+    auth.execute(session, "node.set", &payload)
+}
+
+fn execute_set_properties(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
+    let mut p = params.clone();
+    if let Some(obj) = p.as_object_mut()
+        && let Some(props) = obj.get_mut("props").and_then(Value::as_object_mut)
+    {
+        if let Some(col) = props.remove("color")
+            && !props.contains_key("fill")
+            && !props.contains_key("fills")
+        {
+            props.insert("fill".into(), col);
+        }
+        if let Some(w) = props.get("fontWeight")
+            && let Some(num) = convert_font_weight(w)
+        {
+            props.insert("fontWeight".into(), num);
+        }
+    }
+    auth.execute(session, "node.set", &p)
+}
+
+fn execute_batch_commands(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
+    let cmds = params
+        .get("commands")
+        .and_then(Value::as_array)
+        .ok_or_else(|| EngineError::Other("canvas_batch_commands requires `commands` array".into()))?;
+    let mut results = Vec::new();
+    for item in cmds {
+        let cmd_name =
+            item.get("command").and_then(Value::as_str).ok_or_else(|| EngineError::Other("each batch item requires `command` string".into()))?;
+        let cmd_params = item.get("params").cloned().unwrap_or(Value::Object(serde_json::Map::new()));
+        let res = if cmd_name.starts_with("canvas_") {
+            execute_tool(session, auth, cmd_name, &cmd_params)?
+        } else {
+            auth.execute(session, cmd_name, &cmd_params)?
+        };
+        results.push(res);
+    }
+    Ok(json!({ "results": results }))
+}
+
+fn execute_query_tree(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
+    let doc = session.doc()?;
+    let default_root = match auth.scope() {
+        TaskScope::NewRoot { task_root, page_id } => task_root.unwrap_or(*page_id),
+        TaskScope::Subtree { target_node, .. } => *target_node,
+    };
+    let start_id = params.get("node_id").and_then(Value::as_u64).map(NodeId).unwrap_or(default_root);
+
+    if !auth.is_in_scope(doc, start_id) {
+        return Err(EngineError::Other(format!("Query outside authorized task scope: node {} is not within scope", start_id.0)));
+    }
+
+    let max_depth = params.get("depth").and_then(Value::as_u64).unwrap_or(3).min(10) as usize;
+    let max_nodes = params.get("max_nodes").and_then(Value::as_u64).unwrap_or(200).min(500) as usize;
+    const MAX_BYTES: usize = 48 * 1024;
+
+    let mut node_count = 0;
+    let mut truncated = false;
+    let tree = inspect_node_tree(doc, start_id, 0, max_depth, max_nodes, &mut node_count, &mut truncated);
+
+    let serialized_len = serde_json::to_string(&tree).map(|s| s.len()).unwrap_or(0);
+    if serialized_len > MAX_BYTES {
+        truncated = true;
+    }
+
+    Ok(json!({
+        "root": start_id.0,
+        "total_nodes": node_count,
+        "truncated": truncated,
+        "tree": tree
+    }))
+}
+
+fn execute_export_preview(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
+    let doc = session.doc()?;
+    let default_target = match auth.scope() {
+        TaskScope::NewRoot { task_root, .. } => *task_root,
+        TaskScope::Subtree { target_node, .. } => Some(*target_node),
+    };
+    let target_id = params
+        .get("node_id")
+        .and_then(Value::as_u64)
+        .map(NodeId)
+        .or(default_target)
+        .ok_or_else(|| EngineError::Other("canvas_export_preview requires a valid node_id or established task root".into()))?;
+
+    if !auth.is_in_scope(doc, target_id) {
+        return Err(EngineError::Other(format!("Export outside authorized task scope: node {} is not within scope", target_id.0)));
+    }
+
+    let scale = params.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.1, 2.0);
+    let area = figcraft_engine::cmd::file::export_area(doc, &[target_id], &figcraft_doc::ExportSetting::default())
+        .ok_or_else(|| EngineError::Other("Nothing to render in target area".into()))?;
+    let pix = figcraft_render::render_area(doc, &[target_id], area, scale)
+        .ok_or_else(|| EngineError::Other("Rendering failed (empty area or dimensions exceed max size)".into()))?;
+    let width = pix.width();
+    let height = pix.height();
+    let png_bytes = figcraft_render::encode_png(&pix).map_err(|e| EngineError::Other(format!("PNG encoding error: {e}")))?;
+    let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+
+    Ok(json!({
+        "node_id": target_id.0,
+        "width": width,
+        "height": height,
+        "scale": scale,
+        "byte_size": png_bytes.len(),
+        "png_base64": png_base64
+    }))
+}
+
 /// Execute a dynamic tool or standard command under authoritative task scope.
 pub fn execute_tool(session: &mut Session, auth: &mut TaskAuthority, tool_name: &str, params: &Value) -> Result<Value> {
     if auth.is_stopped() {
@@ -167,175 +411,20 @@ pub fn execute_tool(session: &mut Session, auth: &mut TaskAuthority, tool_name: 
     }
 
     match tool_name {
-        "canvas_create_frame" => {
-            let mut p = params.clone();
-            if let Some(obj) = p.as_object_mut() {
-                // Ensure page context if parent is omitted
-                if !obj.contains_key("parent") {
-                    let page_id = match auth.scope() {
-                        TaskScope::NewRoot { page_id, .. } => *page_id,
-                        TaskScope::Subtree { page_id, .. } => *page_id,
-                    };
-                    obj.insert("parent".into(), json!(page_id.0));
-                }
-            }
-            auth.execute(session, "frame.create", &p)
-        }
-        "canvas_create_text" => {
-            let mut p = params.clone();
-            if let Some(obj) = p.as_object_mut() {
-                if !obj.contains_key("text")
-                    && let Some(c) = obj.get("characters").cloned()
-                {
-                    obj.insert("text".into(), c);
-                }
-                if !obj.contains_key("parent") {
-                    let default_parent = match auth.scope() {
-                        TaskScope::NewRoot { task_root, page_id } => task_root.unwrap_or(*page_id),
-                        TaskScope::Subtree { target_node, .. } => *target_node,
-                    };
-                    obj.insert("parent".into(), json!(default_parent.0));
-                }
-                let mut props = obj.get("props").and_then(Value::as_object).cloned().unwrap_or_default();
-                if let Some(fs) = obj.remove("fontSize") {
-                    props.insert("fontSize".into(), fs);
-                }
-                if let Some(ff) = obj.remove("fontFamily") {
-                    props.insert("fontFamily".into(), ff);
-                }
-                if let Some(fw) = obj.remove("fontWeight") {
-                    props.insert("fontWeight".into(), fw);
-                }
-                if !props.is_empty() {
-                    obj.insert("props".into(), Value::Object(props));
-                }
-            }
-            auth.execute(session, "text.create", &p)
-        }
-        "canvas_create_shape" => {
-            let kind = params.get("kind").and_then(Value::as_str).unwrap_or("rectangle");
-            let cmd = if kind == "ellipse" { "shape.ellipse" } else { "shape.rectangle" };
-            let mut p = params.clone();
-            if let Some(obj) = p.as_object_mut() {
-                obj.remove("kind");
-            }
-            auth.execute(session, cmd, &p)
-        }
-        "canvas_set_layout" => {
-            let id = params.get("id").and_then(Value::as_u64).ok_or_else(|| EngineError::Other("canvas_set_layout requires `id` integer".into()))?;
-            let mut props = serde_json::Map::new();
-            if let Some(mode) = params.get("mode").and_then(Value::as_str) {
-                props.insert("layout".into(), json!(mode));
-            }
-            if let Some(gap) = params.get("gap") {
-                props.insert("gap".into(), gap.clone());
-            }
-            if let Some(cg) = params.get("crossGap") {
-                props.insert("crossGap".into(), cg.clone());
-            }
-            if let Some(pad) = params.get("padding") {
-                props.insert("padding".into(), pad.clone());
-            }
-            if let Some(ma) = params.get("mainAlign") {
-                props.insert("mainAlign".into(), ma.clone());
-            }
-            if let Some(ca) = params.get("crossAlign") {
-                props.insert("crossAlign".into(), ca.clone());
-            }
-            if let Some(wrap) = params.get("wrap") {
-                props.insert("wrap".into(), wrap.clone());
-            }
-            if let Some(sh) = params.get("sizingH") {
-                props.insert("sizingH".into(), sh.clone());
-            }
-            if let Some(sv) = params.get("sizingV") {
-                props.insert("sizingV".into(), sv.clone());
-            }
-            let payload = json!({
-                "id": id,
-                "props": Value::Object(props)
-            });
-            auth.execute(session, "node.set", &payload)
-        }
-        "canvas_set_properties" => auth.execute(session, "node.set", params),
+        "canvas_create_frame" => execute_create_frame(session, auth, params),
+        "canvas_create_text" => execute_create_text(session, auth, params),
+        "canvas_create_shape" => execute_create_shape(session, auth, params),
+        "canvas_set_layout" => execute_set_layout(session, auth, params),
+        "canvas_set_properties" => execute_set_properties(session, auth, params),
         "canvas_delete_layer" => {
             let id =
                 params.get("id").and_then(Value::as_u64).ok_or_else(|| EngineError::Other("canvas_delete_layer requires `id` integer".into()))?;
             auth.execute(session, "edit.delete", &json!({ "ids": [id] }))
         }
-        "canvas_batch_commands" => auth.execute(session, "command.batch", params),
-        "canvas_query_tree" => {
-            let doc = session.doc()?;
-            let default_root = match auth.scope() {
-                TaskScope::NewRoot { task_root, page_id } => task_root.unwrap_or(*page_id),
-                TaskScope::Subtree { target_node, .. } => *target_node,
-            };
-            let start_id = params.get("node_id").and_then(Value::as_u64).map(NodeId).unwrap_or(default_root);
-
-            if !auth.is_in_scope(doc, start_id) {
-                return Err(EngineError::Other(format!("Query outside authorized task scope: node {} is not within scope", start_id.0)));
-            }
-
-            let max_depth = params.get("depth").and_then(Value::as_u64).unwrap_or(3).min(10) as usize;
-            let max_nodes = params.get("max_nodes").and_then(Value::as_u64).unwrap_or(200).min(500) as usize;
-            const MAX_BYTES: usize = 48 * 1024;
-
-            let mut node_count = 0;
-            let mut truncated = false;
-            let tree = inspect_node_tree(doc, start_id, 0, max_depth, max_nodes, &mut node_count, &mut truncated);
-
-            let serialized_len = serde_json::to_string(&tree).map(|s| s.len()).unwrap_or(0);
-            if serialized_len > MAX_BYTES {
-                truncated = true;
-            }
-
-            Ok(json!({
-                "root": start_id.0,
-                "total_nodes": node_count,
-                "truncated": truncated,
-                "tree": tree
-            }))
-        }
-        "canvas_export_preview" => {
-            let doc = session.doc()?;
-            let default_target = match auth.scope() {
-                TaskScope::NewRoot { task_root, .. } => *task_root,
-                TaskScope::Subtree { target_node, .. } => Some(*target_node),
-            };
-            let target_id = params
-                .get("node_id")
-                .and_then(Value::as_u64)
-                .map(NodeId)
-                .or(default_target)
-                .ok_or_else(|| EngineError::Other("canvas_export_preview requires a valid node_id or established task root".into()))?;
-
-            if !auth.is_in_scope(doc, target_id) {
-                return Err(EngineError::Other(format!("Export outside authorized task scope: node {} is not within scope", target_id.0)));
-            }
-
-            let scale = params.get("scale").and_then(Value::as_f64).unwrap_or(1.0).clamp(0.1, 2.0);
-            let area = figcraft_engine::cmd::file::export_area(doc, &[target_id], &figcraft_doc::ExportSetting::default())
-                .ok_or_else(|| EngineError::Other("Nothing to render in target area".into()))?;
-            let pix = figcraft_render::render_area(doc, &[target_id], area, scale)
-                .ok_or_else(|| EngineError::Other("Rendering failed (empty area or dimensions exceed max size)".into()))?;
-            let width = pix.width();
-            let height = pix.height();
-            let png_bytes = figcraft_render::encode_png(&pix).map_err(|e| EngineError::Other(format!("PNG encoding error: {e}")))?;
-            let png_base64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-
-            Ok(json!({
-                "node_id": target_id.0,
-                "width": width,
-                "height": height,
-                "scale": scale,
-                "byte_size": png_bytes.len(),
-                "png_base64": png_base64
-            }))
-        }
-        other => {
-            // Fall back to direct engine command invocation with TaskAuthority scope validation
-            auth.execute(session, other, params)
-        }
+        "canvas_batch_commands" => execute_batch_commands(session, auth, params),
+        "canvas_query_tree" => execute_query_tree(session, auth, params),
+        "canvas_export_preview" => execute_export_preview(session, auth, params),
+        other => auth.execute(session, other, params),
     }
 }
 

@@ -278,6 +278,65 @@ fn test_canvas_dynamic_tool_execution_under_task_authority() {
 }
 
 #[test]
+fn test_canvas_batch_commands_and_text_styling_sanitization() {
+    let mut session = figcraft_engine::Session::new();
+    let _ = session.execute("doc.new", &json!({}));
+    let page_id = session.page().unwrap();
+    let doc_uid = session.ds().unwrap().uid;
+
+    let mut auth = figcraft_engine::TaskAuthority::new("task-batch-test", doc_uid, figcraft_engine::TaskScope::NewRoot { page_id, task_root: None });
+
+    let batch_res = super::tools::execute_tool(
+        &mut session,
+        &mut auth,
+        "canvas_batch_commands",
+        &json!({
+            "commands": [
+                {
+                    "command": "canvas_create_frame",
+                    "params": {
+                        "name": "Batch Frame",
+                        "x": 0,
+                        "y": 0,
+                        "width": 300,
+                        "height": 200
+                    }
+                },
+                {
+                    "command": "canvas_create_text",
+                    "params": {
+                        "text": "Card Heading",
+                        "x": 16,
+                        "y": 16,
+                        "fontSize": 20,
+                        "fontWeight": "Bold",
+                        "color": "#FFFFFF",
+                        "textAlign": "left"
+                    }
+                },
+                {
+                    "command": "canvas_create_shape",
+                    "params": {
+                        "kind": "rectangle",
+                        "x": 16,
+                        "y": 50,
+                        "width": 80,
+                        "height": 24
+                    }
+                }
+            ]
+        }),
+    );
+    assert!(batch_res.is_ok(), "canvas_batch_commands must succeed: {:?}", batch_res);
+    let val = batch_res.unwrap();
+    let results = val["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 3);
+    assert!(results[0].get("id").is_some());
+    assert!(results[1].get("id").is_some());
+    assert!(results[2].get("id").is_some());
+}
+
+#[test]
 fn test_task_authority_scope_and_atomic_rollback() {
     let mut session = figcraft_engine::Session::new();
     let _ = session.execute("doc.new", &json!({}));
