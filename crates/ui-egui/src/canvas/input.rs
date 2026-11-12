@@ -174,7 +174,7 @@ fn pan_view(app: &mut FigApp, ctx: &egui::Context, pos: Pos2, mods: &egui::Modif
     // not: the engine gets its release here, as it does over the canvas or off it.
     if app.canvas.dragging && !ctx.input(|i| i.pointer.primary_down()) {
         app.canvas.dragging = false;
-        send(app, PointerKind::Up, pos, mods);
+        send(app, ctx, PointerKind::Up, pos, mods);
     }
     if !middle_down && !ctx.input(|i| i.pointer.primary_down()) {
         app.canvas.middle_pan = None;
@@ -215,7 +215,7 @@ pub(super) fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> boo
         if app.canvas.dragging && !ctx.input(|i| i.pointer.primary_down()) {
             app.canvas.dragging = false;
             if let Some(at) = hover_pos.or_else(|| app.canvas.last_pointer.map(|p| app.to_screen(p.x, p.y))) {
-                send(app, PointerKind::Up, at, &mods);
+                send(app, &ctx, PointerKind::Up, at, &mods);
             }
         }
         // Leaving the canvas: nothing is hovered there any more.
@@ -365,20 +365,20 @@ pub(super) fn input(app: &mut FigApp, ui: &mut Ui, resp: &egui::Response) -> boo
     }
     if let Some(k) = kind {
         let at = if matches!(k, PointerKind::Down) { press_pos.unwrap_or(pos) } else { pos };
-        send(app, k, at, &mods);
+        send(app, ui.ctx(), k, at, &mods);
         // The pointer also let go within this frame (a quick click, or a slow frame): the tools get
         // the release too, so the press's gesture ends — a quick click with a shape tool still
         // draws and returns to Move, and a double-click right after drawing finds the Move tool.
         if matches!(k, PointerKind::Down) && primary_released {
             app.canvas.dragging = false;
-            send(app, PointerKind::Up, release_pos.unwrap_or(pos), &mods);
+            send(app, ui.ctx(), PointerKind::Up, release_pos.unwrap_or(pos), &mods);
         }
     }
     true
 }
 
 /// Pointer event `kind` at screen point `pos`, to the tools.
-fn send(app: &mut FigApp, kind: PointerKind, pos: Pos2, m: &egui::Modifiers) {
+fn send(app: &mut FigApp, ctx: &egui::Context, kind: PointerKind, pos: Pos2, m: &egui::Modifiers) {
     let ev = pointer_event(app, kind, pos, m);
     // A hover where nothing changed since the last one finds what that one found (the state is
     // taken after it ran: what it set, such as the hovered layer, is part of it).
@@ -386,6 +386,12 @@ fn send(app: &mut FigApp, kind: PointerKind, pos: Pos2, m: &egui::Modifiers) {
     if hover && app.canvas.last_hover.as_ref().is_some_and(|k| *k == HoverKey::of(app, ev.clone())) {
         return;
     }
+    // What the press picked, resolved before the tools run: a press changes the selection, and a
+    // click has to mention the layer the user aimed at, not what the press left selected.
+    let picked = if kind == PointerKind::Down { app.session.canvas_click_target(&ev).ok().flatten() } else { None };
+    // Still inside the click slop of the press: the gesture has not become a drag.
+    let still_click = app.canvas.click.is_some_and(|(at, _)| ev.within_click_slop(at));
+    let press_page = ev.page_pos();
     if kind == PointerKind::Up {
         app.canvas.pressure = None;
     }
@@ -394,7 +400,35 @@ fn send(app: &mut FigApp, kind: PointerKind, pos: Pos2, m: &egui::Modifiers) {
         app.toast(e.to_string());
     }
     app.canvas.last_hover = hover.then(|| HoverKey::of(app, ev));
+    match kind {
+        PointerKind::Down => app.canvas.click = picked.map(|id| (press_page, id)),
+        // A press that leaves the slop was a drag, and a drag never mentions anything.
+        PointerKind::Move if !still_click => app.canvas.click = None,
+        PointerKind::Up => {
+            if let Some((_, id)) = app.canvas.click.take().filter(|_| still_click) {
+                mention(app, ctx, id);
+            }
+        }
+        _ => {}
+    }
     app.handle_ui_requests();
+}
+
+/// Mention `node_id` in the AI composer, if it is on screen: the layer a click picked becomes the
+/// draft's next reference, at the caret the draft last left.
+fn mention(app: &mut FigApp, ctx: &egui::Context, node_id: figcraft_engine::doc::NodeId) {
+    if !app.ui.ai.composer_visible {
+        return;
+    }
+    let Some((uid, page, label)) =
+        app.session.ds().ok().map(|ds| (ds.uid, ds.page, ds.doc.node(node_id).map(|n| n.name.clone()).unwrap_or_default()))
+    else {
+        return;
+    };
+    app.ui.ai.insert_object_mention(uid, page, node_id, &label);
+    app.ui.ai.sync_draft_editor(ctx);
+    // The draft now reads `@Name` at the caret, and the keyboard belongs to it.
+    ctx.memory_mut(|memory| memory.request_focus(crate::ai::composer::input_id()));
 }
 
 /// Right-click at screen `pos`: select what's under the pointer (`deep`: the nested layer), then

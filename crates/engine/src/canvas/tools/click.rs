@@ -1,7 +1,7 @@
 use super::handles::{PATH_REACH_PX, label_at, locked_in, path_candidates, readable_text_fills};
 use super::{
     Affine, Document, Gesture, Node, NodeId, NodeKind, Point, PointerEvent, Rect, Result, Session, Sizing, TextAutoResize, TextData, TextPath,
-    ToolId, frame_at, json, select_target, textedit, within_slop,
+    ToolId, frame_at, json, select_target, textedit,
 };
 
 impl Session {
@@ -338,7 +338,7 @@ impl Session {
     /// Drag out a new text box: past the drag slop it has the drag's size (at least one line
     /// tall) and its top-left, and that size is fixed.
     pub(super) fn text_box_drag(&mut self, ev: &PointerEvent, id: NodeId, start: Point, line: f64) -> Result<()> {
-        if within_slop(ev, start) {
+        if ev.within_click_slop(start) {
             return Ok(());
         }
         let r = Rect::from_points(start, ev.p());

@@ -4,6 +4,8 @@ use figcraft_doc::NodeId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::draft::ObjectMention;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TurnStatus {
     #[default]
@@ -42,6 +44,7 @@ pub struct ToolCallInfo {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PendingApproval {
+    pub method: String,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub request_id: Value,
@@ -53,23 +56,32 @@ pub struct PendingApproval {
 pub struct AiMessage {
     pub role: MessageRole,
     pub text: String,
+    /// The objects the user named, frozen when the turn was sent so the timeline shows the same
+    /// references the task's authority was built from.
+    #[serde(default)]
+    pub mentions: Vec<ObjectMention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<ToolCallInfo>,
 }
 
 impl AiMessage {
-    pub fn user(text: impl Into<String>) -> Self {
-        Self { role: MessageRole::User, text: text.into(), tool_call: None }
+    pub fn user(text: impl Into<String>, mentions: Vec<ObjectMention>) -> Self {
+        Self { role: MessageRole::User, text: text.into(), mentions, tool_call: None }
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
-        Self { role: MessageRole::Assistant, text: text.into(), tool_call: None }
+        Self { role: MessageRole::Assistant, text: text.into(), mentions: Vec::new(), tool_call: None }
+    }
+
+    pub fn system(text: impl Into<String>) -> Self {
+        Self { role: MessageRole::System, text: text.into(), mentions: Vec::new(), tool_call: None }
     }
 
     pub fn tool(tool_id: &str, tool_name: &str, params: Value) -> Self {
         Self {
             role: MessageRole::Tool,
             text: String::new(),
+            mentions: Vec::new(),
             tool_call: Some(ToolCallInfo {
                 tool_id: tool_id.to_string(),
                 tool_name: tool_name.to_string(),
@@ -129,14 +141,14 @@ impl AiSession {
         }
     }
 
-    pub fn append_user_message(&mut self, text: &str) {
+    pub fn append_user_message(&mut self, text: &str, mentions: Vec<ObjectMention>) {
         if self.messages.is_empty() {
             // First message sets title
             let first_line = text.lines().next().unwrap_or(text);
             let truncated: String = first_line.chars().take(28).collect();
             self.title = if first_line.len() > 28 { format!("{truncated}…") } else { truncated };
         }
-        self.messages.push(AiMessage::user(text));
+        self.messages.push(AiMessage::user(text, mentions));
     }
 
     pub fn append_assistant_delta(&mut self, delta: &str) {

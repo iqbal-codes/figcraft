@@ -13,7 +13,7 @@ use super::regions::region_hit;
 use super::transform::{self, BoxHit, PointBox};
 use super::{EditPart, VHit, VTool, VectorEdit, edit, editing, hit, hit_any, local_offset, network, ops, points_of, selected_points, set_state};
 use crate::snap::Targets;
-use crate::tools::{Cursor, Gesture, Handle, PenCursor, PointerEvent, PointerKind, within_slop};
+use crate::tools::{Cursor, Gesture, Handle, PenCursor, PointerEvent, PointerKind};
 use crate::{Result, Session};
 
 /// An in-progress edit-mode gesture (cheap to clone: snap targets are shared).
@@ -1091,7 +1091,7 @@ impl Session {
             VGesture::Handle { .. } | VGesture::BendSegment { .. } | VGesture::Pen { .. } | VGesture::BoxRotate { .. } => {
                 self.commit_interaction()?
             }
-            VGesture::Marquee { start, leave: Some(press), .. } if within_slop(ev, start) => {
+            VGesture::Marquee { start, leave: Some(press), .. } if ev.within_click_slop(start) => {
                 super::end(self)?;
                 self.pointer(&press)?;
                 return self.pointer(ev);

@@ -1171,8 +1171,14 @@ fn ui_set_view(app: &mut FigApp, ctx: &Context, p: &Value) -> Result<(), String>
     if let Some(eff) = p.get("aiEffort").and_then(Value::as_str) {
         app.ui.ai.select_effort(Some(eff.to_string()));
     }
+    // A mention is authority over an object, so it can only come from clicking that object on the
+    // canvas; a request cannot spell one into existence.
+    if p.get("mentions").is_some() {
+        return Err("aiDraft replaces the draft text only: mentions come from clicking a layer on the canvas".into());
+    }
     if let Some(draft) = p.get("aiDraft").and_then(Value::as_str) {
-        app.ui.ai.draft_text = draft.to_string();
+        app.ui.ai.replace_draft_text(draft);
+        app.ui.ai.sync_draft_editor(ctx);
     }
     if let Some(submit) = p.get("aiSubmit").and_then(Value::as_bool)
         && submit
@@ -1185,7 +1191,7 @@ fn ui_set_view(app: &mut FigApp, ctx: &Context, p: &Value) -> Result<(), String>
     if let Some(stop) = p.get("aiStop").and_then(Value::as_bool)
         && stop
     {
-        app.ui.ai.stop_active_task();
+        app.ui.ai.stop_running_task();
     }
     if let Some(t) = p.get("theme").and_then(Value::as_str) {
         app.session.prefs.theme = t.to_string();

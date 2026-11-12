@@ -4,6 +4,178 @@ use super::protocol::ProtocolEvent;
 use super::supervisor::{CodexSupervisor, HarnessState, MockSupervisorTransport, SupervisorPhase};
 use super::{AiState, TurnStatus};
 
+/// A model catalog to send against. The app starts with none and only the harness fills it, so a
+/// test that sends a turn states what it is running on.
+fn seed_models(ai: &mut AiState) {
+    ai.set_models(vec![
+        super::supervisor::ModelInfo {
+            id: "gpt-5.6-sol".to_string(),
+            display_name: Some("GPT-5.6 Sol".to_string()),
+            supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+            default_effort: Some("medium".into()),
+        },
+        super::supervisor::ModelInfo {
+            id: "gpt-6.1-sol".to_string(),
+            display_name: Some("GPT-6.1 Sol".to_string()),
+            supported_efforts: vec!["low".into(), "high".into(), "max".into()],
+            default_effort: Some("high".into()),
+        },
+    ]);
+}
+
+/// The rect the left panel gives the composer: the bottom of a narrow AI dock.
+fn composer_rect() -> egui::Rect {
+    egui::Rect::from_min_size(egui::Pos2::new(0.0, 480.0 - super::composer::COMPOSER_HEIGHT), egui::vec2(200.0, super::composer::COMPOSER_HEIGHT))
+}
+
+#[test]
+fn composer_exposes_actionable_send_and_stop_to_accessibility() {
+    let mut app = crate::FigApp::new(figcraft_engine::Session::new(), Box::new(crate::NoServices));
+    seed_models(&mut app.ui.ai);
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    for (index, running, draft, label, disabled) in [(0, false, "", "Send", true), (1, false, "Design", "Send", false), (2, true, "", "Stop", false)]
+    {
+        app.ui.ai.is_running = running;
+        app.ui.ai.draft_text = draft.into();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 480.0))),
+            time: Some(f64::from(index)),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| super::composer::show(&mut app, ui, composer_rect()));
+        output.textures_delta.clear();
+        let update = output.platform_output.accesskit_update.unwrap();
+        let (_, button) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == egui::accesskit::Role::Button && node.label() == Some(label))
+            .expect("named composer button");
+        assert_eq!(button.is_disabled(), disabled, "wrong accessible enabled state for {label}");
+    }
+}
+
+#[test]
+fn runtime_denies_external_requests_with_their_actual_response_schema() {
+    for (method, expected) in [
+        ("item/commandExecution/requestApproval", json!({"decision": "decline"})),
+        ("item/fileChange/requestApproval", json!({"decision": "decline"})),
+        ("item/permissions/requestApproval", json!({"permissions": {}, "scope": "turn"})),
+    ] {
+        let transport = MockSupervisorTransport::new();
+        let handle = transport.clone();
+        let mut app = crate::FigApp::new(figcraft_engine::Session::new(), Box::new(crate::NoServices));
+        app.ui.ai.supervisor = Some(CodexSupervisor::new(Box::new(transport)));
+        app.ui.ai.sessions[0].thread_id = Some("thread".into());
+        app.ui.ai.sessions[0].active_turn_id = Some("turn".into());
+        app.ui.ai.sessions[0].status = TurnStatus::Running;
+        handle.push_incoming(
+            json!({"id": 77, "method": method, "params": {"threadId": "thread", "turnId": "turn", "command": "external action"}}).to_string(),
+        );
+        super::update_ai_runtime(&mut app, &egui::Context::default());
+        let responses: Vec<serde_json::Value> =
+            handle.sent_lines().iter().filter_map(|line| serde_json::from_str(line).ok()).filter(|v: &serde_json::Value| v["id"] == 77).collect();
+        assert_eq!(responses.len(), 1, "unsupported permission must settle without waiting for a button: {method}");
+        assert_eq!(responses[0]["result"], expected);
+        assert_eq!(app.ui.ai.sessions[0].status, TurnStatus::Running);
+    }
+}
+
+#[test]
+fn unknown_server_request_does_not_abort_the_running_turn() {
+    let transport = MockSupervisorTransport::new();
+    let handle = transport.clone();
+    let mut app = crate::FigApp::new(figcraft_engine::Session::new(), Box::new(crate::NoServices));
+    app.ui.ai.supervisor = Some(CodexSupervisor::new(Box::new(transport)));
+    app.ui.ai.sessions[0].thread_id = Some("thread".into());
+    app.ui.ai.sessions[0].active_turn_id = Some("turn".into());
+    app.ui.ai.sessions[0].status = TurnStatus::Running;
+    handle.push_incoming(json!({"id": 78, "method": "future/request", "params": {"threadId": "thread", "turnId": "turn"}}).to_string());
+    super::update_ai_runtime(&mut app, &egui::Context::default());
+    assert_eq!(app.ui.ai.sessions[0].status, TurnStatus::Running);
+    assert_eq!(app.ui.ai.sessions[0].active_turn_id.as_deref(), Some("turn"));
+    assert!(handle.sent_lines().iter().any(|line| line.contains("-32601")));
+}
+
+#[test]
+fn external_edit_requires_fresh_tool_context_before_another_mutation() {
+    let mut session = figcraft_engine::Session::new();
+    let root = session.execute("frame.create", &json!({"width": 200, "height": 100})).unwrap()["id"].as_u64().unwrap();
+    let ds = session.ds().unwrap();
+    let mut auth = figcraft_engine::TaskAuthority::new_with_revision(
+        "refresh",
+        ds.uid,
+        ds.revision,
+        figcraft_engine::TaskScope::Subtree { page_id: ds.page, target_node: figcraft_doc::NodeId(root) },
+    );
+    session.execute("node.set", &json!({"id": root, "props": {"name": "Human edit"}})).unwrap();
+    let mutation = json!({"id": root, "props": {"name": "Agent edit"}});
+    let stale = super::execute_tool(&mut session, &mut auth, "canvas_set_properties", &mutation);
+    assert!(stale.is_err(), "stale tool must not silently overwrite a human edit");
+    let fresh = super::execute_tool(&mut session, &mut auth, "canvas_query_tree", &json!({})).unwrap();
+    assert_eq!(fresh["tree"]["name"], "Human edit");
+    super::execute_tool(&mut session, &mut auth, "canvas_set_properties", &mutation).unwrap();
+}
+
+#[test]
+fn selection_and_view_changes_do_not_invalidate_inspected_canvas_context() {
+    let mut session = figcraft_engine::Session::new();
+    let root = session.execute("frame.create", &json!({"width": 200, "height": 100})).unwrap()["id"].as_u64().unwrap();
+    let ds = session.ds().unwrap();
+    let mut auth = figcraft_engine::TaskAuthority::new_with_revision(
+        "view-change",
+        ds.uid,
+        ds.revision,
+        figcraft_engine::TaskScope::Subtree { page_id: ds.page, target_node: figcraft_doc::NodeId(root) },
+    );
+    super::execute_tool(&mut session, &mut auth, "canvas_query_tree", &json!({})).unwrap();
+    session.set_selection(vec![]);
+    session.execute("view.zoomIn", &json!({})).unwrap();
+    super::execute_tool(&mut session, &mut auth, "canvas_set_properties", &json!({"id": root, "props": {"name": "After view change"}}))
+        .expect("selection and zoom do not edit the inspected document");
+    session.execute("view.zoomOut", &json!({})).unwrap();
+    super::execute_tool(&mut session, &mut auth, "canvas_set_properties", &json!({"id": root, "props": {"name": "After own edit"}}))
+        .expect("own edits must also retain the document snapshot");
+    session.execute("node.set", &json!({"id": root, "props": {"name": "Human edit"}})).unwrap();
+    assert!(
+        super::execute_tool(&mut session, &mut auth, "canvas_set_properties", &json!({"id": root, "props": {"name": "Stale overwrite"}})).is_err()
+    );
+    assert_eq!(session.doc().unwrap().node(figcraft_doc::NodeId(root)).unwrap().name, "Human edit");
+}
+
+#[test]
+fn composer_keeps_ime_composition_across_frames_until_commit() {
+    use egui::{Event, ImeEvent, Key, Modifiers};
+    fn frame(ctx: &egui::Context, app: &mut crate::FigApp, index: u32, events: Vec<Event>) {
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::unique("ai_composer_input")));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 480.0))),
+            time: Some(f64::from(index) / 60.0),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| super::composer::show(app, ui, composer_rect()));
+        output.textures_delta.clear();
+    }
+    let mut app = crate::FigApp::new(figcraft_engine::Session::new(), Box::new(crate::NoServices));
+    app.ui.ai.supervisor = Some(CodexSupervisor::new(Box::new(MockSupervisorTransport::new())));
+    seed_models(&mut app.ui.ai);
+    app.ui.ai.draft_text = "Design".into();
+    let ctx = egui::Context::default();
+    let key = |pressed| Event::Key { key: Key::Enter, physical_key: Some(Key::Enter), pressed, repeat: false, modifiers: Modifiers::NONE };
+    frame(&ctx, &mut app, 0, vec![]);
+    frame(&ctx, &mut app, 1, vec![Event::Ime(ImeEvent::Preedit { text: "候補".into(), active_range_chars: None })]);
+    frame(&ctx, &mut app, 2, vec![key(true)]);
+    assert!(app.ui.ai.sessions[0].messages.is_empty(), "IME candidate confirmation submitted a turn");
+    assert!(!app.ui.ai.draft_text.is_empty(), "IME confirmation lost the draft");
+    frame(&ctx, &mut app, 3, vec![key(false)]);
+    frame(&ctx, &mut app, 4, vec![Event::Ime(ImeEvent::Commit("候補".into())), key(true)]);
+    assert!(app.ui.ai.sessions[0].messages.is_empty(), "commit-frame Enter submitted a turn");
+    frame(&ctx, &mut app, 5, vec![key(false)]);
+    frame(&ctx, &mut app, 6, vec![key(true)]);
+    assert_eq!(app.ui.ai.sessions[0].messages.len(), 1, "a deliberate Enter after composition should submit exactly once");
+}
+
 #[test]
 fn test_supervisor_initialization_and_handshake_lifecycle() {
     let transport = MockSupervisorTransport::new();
@@ -63,6 +235,7 @@ fn test_supervisor_stream_delta_and_approvals() {
         text: "Designing a navbar".into()
     }));
     assert!(events.contains(&ProtocolEvent::ApprovalRequired {
+        method: "item/permissions/requestApproval".into(),
         thread_id: Some("th_1".into()),
         turn_id: Some("t_1".into()),
         request_id: json!("req_appr"),
@@ -79,7 +252,7 @@ fn test_supervisor_interrupt_and_stop_with_turn_identity() {
     let transport = MockSupervisorTransport::new();
     let mut supervisor = CodexSupervisor::new(Box::new(transport));
 
-    let req_id = supervisor.interrupt_turn("th_abc", "turn_xyz");
+    let req_id = supervisor.interrupt_turn("th_abc", "turn_xyz").expect("interrupt sent");
     assert!(req_id > 0);
 }
 
@@ -112,6 +285,7 @@ fn test_ai_state_turn_thread_correlation_and_stop() {
     let transport = MockSupervisorTransport::new();
     let supervisor = CodexSupervisor::new(Box::new(transport));
     let mut state = AiState::with_supervisor(supervisor);
+    seed_models(&mut state);
 
     let mut session = figcraft_engine::Session::new();
     let _ = session.execute("doc.new", &json!({}));
@@ -125,7 +299,7 @@ fn test_ai_state_turn_thread_correlation_and_stop() {
     assert!(state.sessions[0].pending_turn_prompt.is_some());
     assert!(state.active_task().is_some());
 
-    state.stop_active_task();
+    state.stop_running_task();
     assert!(!state.is_running);
     assert_eq!(state.sessions[0].status, TurnStatus::Stopped);
     assert!(state.active_task().unwrap().is_stopped());
@@ -143,6 +317,7 @@ fn test_stop_lifecycle_prevents_late_turn_overwrite_and_tool_mutations() {
     app.ui.ai.supervisor = Some(supervisor);
 
     // Submit turn to establish running session
+    seed_models(&mut app.ui.ai);
     app.ui.ai.draft_text = "Generate cards".into();
     app.ui.ai.submit_turn(&mut app.session);
     assert!(app.ui.ai.is_running);
@@ -151,7 +326,7 @@ fn test_stop_lifecycle_prevents_late_turn_overwrite_and_tool_mutations() {
     app.ui.ai.sessions[0].active_turn_id = Some("turn_initial".into());
 
     // Stop active task
-    app.ui.ai.stop_active_task();
+    app.ui.ai.stop_running_task();
     assert!(!app.ui.ai.is_running);
     assert_eq!(app.ui.ai.sessions[0].status, TurnStatus::Stopped);
     assert!(app.ui.ai.sessions[0].pending_turn_prompt.is_none());
@@ -159,7 +334,7 @@ fn test_stop_lifecycle_prevents_late_turn_overwrite_and_tool_mutations() {
     assert!(auth.is_stopped());
 
     // Simulate late TurnStarted event arriving after Stop
-    handle.push_incoming(&format!(r#"{{"method":"turn/started","params":{{"threadId":"{thread_id}","turnId":"turn_late"}}}}"#));
+    handle.push_incoming(format!(r#"{{"method":"turn/started","params":{{"threadId":"{thread_id}","turnId":"turn_late"}}}}"#));
     let ctx = egui::Context::default();
     super::update_ai_runtime(&mut app, &ctx);
 
@@ -168,7 +343,7 @@ fn test_stop_lifecycle_prevents_late_turn_overwrite_and_tool_mutations() {
     assert_eq!(app.ui.ai.sessions[0].status, TurnStatus::Stopped, "late TurnStarted must not overwrite Stopped status");
 
     // Simulate late AgentDelta event arriving after Stop
-    handle.push_incoming(&format!(
+    handle.push_incoming(format!(
         r#"{{"method":"item/agentMessage/delta","params":{{"threadId":"{thread_id}","turnId":"turn_late","delta":"unwanted text"}}}}"#
     ));
     super::update_ai_runtime(&mut app, &ctx);
@@ -179,7 +354,7 @@ fn test_stop_lifecycle_prevents_late_turn_overwrite_and_tool_mutations() {
     );
 
     // Simulate late TurnCompleted event arriving after Stop
-    handle.push_incoming(&format!(r#"{{"method":"turn/completed","params":{{"threadId":"{thread_id}","turnId":"turn_late"}}}}"#));
+    handle.push_incoming(format!(r#"{{"method":"turn/completed","params":{{"threadId":"{thread_id}","turnId":"turn_late"}}}}"#));
     super::update_ai_runtime(&mut app, &ctx);
 
     // Must remain Stopped, NOT completed
@@ -202,6 +377,7 @@ fn test_event_routing_to_bound_thread_not_active_session() {
     let transport = MockSupervisorTransport::new();
     let supervisor = CodexSupervisor::new(Box::new(transport));
     let mut state = AiState::with_supervisor(supervisor);
+    seed_models(&mut state);
 
     let mut session = figcraft_engine::Session::new();
     let _ = session.execute("doc.new", &json!({}));
@@ -663,7 +839,7 @@ fn test_supervisor_replies_to_unknown_server_requests_with_protocol_error() {
     assert!(reply_str.contains("-32601"), "Error code should be -32601 (Method not found)");
 
     // Must also produce visible honest event so harness state is transparent
-    assert!(events.iter().any(|e| matches!(e, ProtocolEvent::Error { message, .. } if message.contains("unsupported/serverMethod"))));
+    assert!(events.iter().any(|e| matches!(e, ProtocolEvent::Notice { message, .. } if message.contains("unsupported/serverMethod"))));
 }
 
 #[test]
@@ -701,18 +877,17 @@ fn test_conversation_view_switching_cannot_retarget_tool_calls_or_deltas_and_sta
 
 #[test]
 fn test_unsupported_external_permissions_are_visibly_denied_with_schema_responses_and_duplicate_replies_rejected() {
-    use super::protocol::format_permission_denial_response;
+    use super::protocol::permission_denial_result;
 
     // Verify schema-correct denial for external execution
-    let cmd_denial =
-        format_permission_denial_response(&json!("req_cmd_1"), "item/commandExecution/requestApproval", "External execution outside canvas");
+    let cmd_denial = permission_denial_result("item/commandExecution/requestApproval").unwrap().to_string();
     assert!(
         cmd_denial.contains(r#""decision":"decline""#) || cmd_denial.contains(r#""decision": "decline""#),
         "commandExecution must use schema-correct 'decline' decision: {cmd_denial}"
     );
 
     // Verify schema-correct denial for external file changes
-    let file_denial = format_permission_denial_response(&json!("req_file_1"), "item/fileChange/requestApproval", "External file edit outside canvas");
+    let file_denial = permission_denial_result("item/fileChange/requestApproval").unwrap().to_string();
     assert!(
         file_denial.contains(r#""decision":"decline""#) || file_denial.contains(r#""decision": "decline""#),
         "fileChange must use schema-correct 'decline' decision: {file_denial}"
@@ -801,4 +976,351 @@ fn test_ime_confirmation_does_not_submit_turn_and_composer_does_not_steal_shortc
 
     let is_ime_confirming = has_ime_event.iter().any(|e| matches!(e, Event::Ime(_)));
     assert!(is_ime_confirming, "IME commit must be detected so Enter does not trigger turn submit");
+}
+
+// ---- The draft's references, and what a send is allowed to authorize ----
+
+/// An app ready to send: a document, a live harness and a catalog to run on.
+fn sending_app() -> crate::FigApp {
+    let mut session = figcraft_engine::Session::new();
+    let _ = session.execute("doc.new", &json!({}));
+    let mut app = crate::FigApp::new(session, Box::new(crate::NoServices));
+    app.ui.ai.supervisor = Some(CodexSupervisor::new(Box::new(MockSupervisorTransport::new())));
+    seed_models(&mut app.ui.ai);
+    app
+}
+
+/// A frame named `name` on the open page.
+fn named_frame(app: &mut crate::FigApp, name: &str) -> figcraft_doc::NodeId {
+    let frame = app.session.execute("frame.create", &json!({"width": 100.0, "height": 100.0, "name": name})).expect("frame created");
+    figcraft_doc::NodeId(frame["id"].as_u64().expect("frame id"))
+}
+
+fn open_page(app: &crate::FigApp) -> figcraft_doc::NodeId {
+    app.session.page().expect("open page")
+}
+
+#[test]
+fn a_clicked_layer_becomes_a_token_where_the_caret_was() {
+    let mut app = sending_app();
+    let page = open_page(&app);
+    let header = named_frame(&mut app, "Header");
+    let uid = app.session.ds().expect("document").uid;
+
+    app.ui.ai.draft_text = "restyle ".into();
+    app.ui.ai.draft_meta.set_selection(8, 8);
+    app.ui.ai.insert_object_mention(uid, page, header, "Header");
+
+    assert_eq!(app.ui.ai.draft_text, "restyle @Header");
+    let mentions = app.ui.ai.draft_mentions().to_vec();
+    assert_eq!(mentions.len(), 1);
+    assert_eq!(mentions[0].node_id, header);
+    assert_eq!(mentions[0].page_id, page);
+    assert_eq!((mentions[0].start_char, mentions[0].end_char), (8, 15));
+    // The caret follows the token, so typing carries on after it.
+    assert_eq!(app.ui.ai.draft_meta.selection(), (15, 15));
+}
+
+#[test]
+fn two_clicks_in_a_row_keep_both_references_apart() {
+    let mut app = sending_app();
+    let page = open_page(&app);
+    let header = named_frame(&mut app, "Header");
+    let card = named_frame(&mut app, "Card");
+    let uid = app.session.ds().expect("document").uid;
+
+    app.ui.ai.insert_object_mention(uid, page, header, "Header");
+    app.ui.ai.insert_object_mention(uid, page, card, "Card");
+
+    assert_eq!(app.ui.ai.draft_text, "@Header @Card", "a separator keeps the two tokens apart");
+    let mentions = app.ui.ai.draft_mentions().to_vec();
+    assert_eq!(mentions.len(), 2);
+    assert_eq!((mentions[0].start_char, mentions[0].end_char), (0, 7));
+    assert_eq!((mentions[1].start_char, mentions[1].end_char), (8, 13));
+}
+
+#[test]
+fn typing_a_name_that_looks_like_a_token_grants_nothing() {
+    let mut app = sending_app();
+    {
+        use egui::TextBuffer as _;
+        let mut buffer = super::draft::DraftBuffer { text: &mut app.ui.ai.draft_text, meta: &mut app.ui.ai.draft_meta };
+        buffer.insert_text("@Header", egui::text::CharIndex(0));
+    }
+    assert_eq!(app.ui.ai.draft_text, "@Header");
+    assert!(app.ui.ai.draft_mentions().is_empty(), "typed text must not become authority");
+}
+
+#[test]
+fn deleting_part_of_a_token_removes_the_whole_reference() {
+    let mut app = sending_app();
+    let page = open_page(&app);
+    let header = named_frame(&mut app, "Header");
+    let uid = app.session.ds().expect("document").uid;
+    app.ui.ai.insert_object_mention(uid, page, header, "Header");
+    assert_eq!(app.ui.ai.draft_text, "@Header");
+
+    {
+        // One keystroke inside the name cannot leave half a reference behind.
+        use egui::TextBuffer as _;
+        let mut buffer = super::draft::DraftBuffer { text: &mut app.ui.ai.draft_text, meta: &mut app.ui.ai.draft_meta };
+        buffer.delete_char_range(egui::text::CharIndex(3)..egui::text::CharIndex(4));
+    }
+    assert_eq!(app.ui.ai.draft_text, "");
+    assert!(app.ui.ai.draft_mentions().is_empty());
+}
+
+#[test]
+fn undo_and_redo_carry_a_drafts_text_tokens_and_caret_together() {
+    let mut app = sending_app();
+    let page = open_page(&app);
+    let header = named_frame(&mut app, "Header");
+    let uid = app.session.ds().expect("document").uid;
+
+    app.ui.ai.draft_text = "fix ".into();
+    app.ui.ai.draft_meta.set_selection(4, 4);
+    app.ui.ai.draft_meta.end_frame(&app.ui.ai.draft_text);
+    app.ui.ai.insert_object_mention(uid, page, header, "Header");
+    assert_eq!(app.ui.ai.draft_text, "fix @Header");
+
+    assert!(app.ui.ai.draft_meta.undo(&mut app.ui.ai.draft_text), "the click is undoable");
+    assert_eq!(app.ui.ai.draft_text, "fix ");
+    assert!(app.ui.ai.draft_mentions().is_empty(), "undo must not leave a reference without its token");
+
+    assert!(app.ui.ai.draft_meta.redo(&mut app.ui.ai.draft_text));
+    assert_eq!(app.ui.ai.draft_text, "fix @Header");
+    assert_eq!(app.ui.ai.draft_mentions().len(), 1);
+}
+
+#[test]
+fn plain_text_replacement_drops_every_reference() {
+    let mut app = sending_app();
+    let page = open_page(&app);
+    let header = named_frame(&mut app, "Header");
+    let uid = app.session.ds().expect("document").uid;
+    app.ui.ai.insert_object_mention(uid, page, header, "Header");
+
+    app.ui.ai.replace_draft_text("something else entirely");
+    assert_eq!(app.ui.ai.draft_text, "something else entirely");
+    assert!(app.ui.ai.draft_mentions().is_empty());
+    assert_eq!(app.ui.ai.draft_meta.selection(), (23, 23), "the caret follows the replacement");
+}
+
+#[test]
+fn sending_two_mentions_authorizes_exactly_those_two_on_the_open_page() {
+    let mut app = sending_app();
+    let page = open_page(&app);
+    let header = named_frame(&mut app, "Header");
+    let card = named_frame(&mut app, "Card");
+    let uid = app.session.ds().expect("document").uid;
+    app.ui.ai.insert_object_mention(uid, page, header, "Header");
+    app.ui.ai.insert_object_mention(uid, page, card, "Card");
+
+    app.ui.ai.submit_turn(&mut app.session);
+
+    assert!(app.ui.ai.is_running, "a resolvable draft starts its turn");
+    let task = app.ui.ai.sessions[0].task.as_ref().expect("a frozen task");
+    match task.scope() {
+        figcraft_engine::TaskScope::Subtrees { page_id, target_nodes } => {
+            assert_eq!(*page_id, page);
+            assert_eq!(target_nodes, &vec![header, card], "both named objects, in mention order");
+        }
+        other => panic!("expected the two mentions as the scope, got {other:?}"),
+    }
+    assert_eq!(app.ui.ai.sessions[0].messages[0].mentions.len(), 2, "the timeline keeps what was sent for");
+    assert!(app.ui.ai.draft_text.is_empty(), "the sent draft is cleared");
+    assert!(app.ui.ai.draft_mentions().is_empty());
+}
+
+#[test]
+fn a_draft_without_a_mention_is_a_new_root_whatever_is_selected() {
+    let mut app = sending_app();
+    let page = open_page(&app);
+    let header = named_frame(&mut app, "Header");
+    // The user picked a layer by hand; picking is not naming.
+    app.session.ds_mut().expect("document").selection = vec![header];
+    app.ui.ai.draft_text = "Draw a toolbar".into();
+
+    app.ui.ai.submit_turn(&mut app.session);
+
+    assert!(app.ui.ai.is_running);
+    let task = app.ui.ai.sessions[0].task.as_ref().expect("a frozen task");
+    assert_eq!(task.scope(), &figcraft_engine::TaskScope::NewRoot { page_id: page, task_root: None });
+}
+
+#[test]
+fn a_reference_that_no_longer_resolves_blocks_the_turn_and_keeps_the_draft() {
+    let mut app = sending_app();
+    let page = open_page(&app);
+    let header = named_frame(&mut app, "Header");
+    let card = named_frame(&mut app, "Card");
+    let uid = app.session.ds().expect("document").uid;
+    app.ui.ai.insert_object_mention(uid, page, header, "Header");
+    app.ui.ai.insert_object_mention(uid, page, card, "Card");
+    let drafted = app.ui.ai.draft_text.clone();
+
+    // The user deletes one of the two named layers before sending.
+    app.session.execute("edit.delete", &json!({"ids": [header.0]})).expect("deleted");
+
+    app.ui.ai.submit_turn(&mut app.session);
+
+    assert!(!app.ui.ai.is_running, "a stale reference must not start a turn");
+    assert!(app.ui.ai.sessions[0].messages.is_empty(), "nothing was sent");
+    assert!(app.ui.ai.sessions[0].task.is_none(), "no authority was frozen");
+    assert_eq!(app.ui.ai.draft_text, drafted, "the refused draft keeps every character");
+    assert!(app.ui.ai.draft_meta.error.is_some(), "and says why");
+}
+
+#[test]
+fn a_turn_needs_a_model_and_keeps_the_draft_without_one() {
+    let mut session = figcraft_engine::Session::new();
+    let _ = session.execute("doc.new", &json!({}));
+    let mut app = crate::FigApp::new(session, Box::new(crate::NoServices));
+    app.ui.ai.supervisor = Some(CodexSupervisor::new(Box::new(MockSupervisorTransport::new())));
+    app.ui.ai.draft_text = "Draw a button".into();
+
+    app.ui.ai.submit_turn(&mut app.session);
+
+    assert!(!app.ui.ai.is_running, "there is no catalog to run on");
+    assert_eq!(app.ui.ai.draft_text, "Draw a button");
+    assert!(app.ui.ai.draft_meta.error.is_some());
+}
+
+#[test]
+fn a_model_list_with_nothing_in_it_still_ends_discovery() {
+    let transport = MockSupervisorTransport::new();
+    let handle = transport.clone();
+    let mut supervisor = CodexSupervisor::new(Box::new(transport));
+    handle.push_incoming(r#"{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex/0.167.0"}}"#);
+    let _ = supervisor.poll_events();
+    handle.push_incoming(r#"{"jsonrpc":"2.0","id":2,"result":{"data":[]}}"#);
+    handle.push_incoming(r#"{"jsonrpc":"2.0","id":3,"result":{"account":{"email":"a@b.c","planType":"plus"}}}"#);
+
+    let events = supervisor.poll_events();
+
+    assert_eq!(supervisor.harness_state, HarnessState::Ready, "discovery ends, it does not wait forever");
+    assert!(supervisor.available_models.is_empty());
+    assert!(events.iter().any(|e| matches!(e, ProtocolEvent::Initialized { .. })));
+}
+
+#[test]
+fn a_model_list_failure_reports_no_models_and_is_not_a_dead_process() {
+    let transport = MockSupervisorTransport::new();
+    let handle = transport.clone();
+    let mut supervisor = CodexSupervisor::new(Box::new(transport));
+    handle.push_incoming(r#"{"jsonrpc":"2.0","id":1,"result":{"userAgent":"codex/0.167.0"}}"#);
+    let _ = supervisor.poll_events();
+    handle.push_incoming(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"no model list"}}"#);
+    handle.push_incoming(r#"{"jsonrpc":"2.0","id":3,"result":{"account":{"email":"a@b.c","planType":"plus"}}}"#);
+
+    let events = supervisor.poll_events();
+
+    assert_eq!(supervisor.harness_state, HarnessState::Ready, "the harness is alive, it just has no models");
+    assert!(supervisor.available_models.is_empty());
+    assert!(events.iter().any(|e| matches!(e, ProtocolEvent::ModelDiscoveryFailed { .. })));
+    assert!(!events.iter().any(|e| matches!(e, ProtocolEvent::Error { .. })), "a failed request is not a failed process");
+}
+
+#[test]
+fn a_model_discovery_failure_leaves_an_honest_empty_catalog_and_a_running_turn_alone() {
+    let mut app = sending_app();
+    let page = open_page(&app);
+    let header = named_frame(&mut app, "Header");
+    let uid = app.session.ds().expect("document").uid;
+    app.ui.ai.insert_object_mention(uid, page, header, "Header");
+    app.ui.ai.submit_turn(&mut app.session);
+    assert!(app.ui.ai.is_running);
+
+    super::dispatch_ai_event(&mut app, ProtocolEvent::ModelDiscoveryFailed { message: "no model list".into() });
+
+    assert!(app.ui.ai.available_models.is_empty(), "the catalog is empty, not stale");
+    assert!(app.ui.ai.selected_model.is_empty());
+    assert!(app.ui.ai.selected_effort.is_none());
+    assert_eq!(app.ui.ai.harness_state, HarnessState::Ready);
+    assert!(app.ui.ai.is_running, "a catalog failure does not abort the turn already running");
+    assert_eq!(app.ui.ai.sessions[0].status, TurnStatus::Running);
+    assert!(app.ui.ai.sessions[0].messages.iter().any(|m| m.text == "Models unavailable."), "and it says so");
+}
+
+#[test]
+fn the_composer_footer_fits_a_narrow_panel_without_wrapping() {
+    // A 200pt dock: 200 less the composer's two 8pt insets.
+    assert_eq!(super::composer::footer_widths_for_test(184.0), (68.0, 56.0, 48.0));
+    // A 280pt dock.
+    assert_eq!(super::composer::footer_widths_for_test(264.0), (148.0, 56.0, 48.0));
+
+    // Whatever the width, the row fits: items plus the two gaps never exceed what it was given.
+    for inner in [60.0_f32, 100.0, 140.0, 184.0, 264.0, 600.0] {
+        let (model, effort, send) = super::composer::footer_widths_for_test(inner);
+        let gaps = if model > 0.0 { 2.0 * 6.0 } else { 6.0 };
+        assert!(model + effort + send + gaps <= inner + 0.01, "the footer overflows {inner}pt: {model}+{effort}+{send}");
+        assert_eq!(send, 48.0, "Send keeps its size so it is always the same target");
+    }
+
+    // Just wide enough for the model at its minimum: it keeps exactly that.
+    assert_eq!(super::composer::footer_widths_for_test(160.0), (44.0, 56.0, 48.0));
+    // Narrower than that, the model is dropped rather than shown unreadably.
+    let (model, effort, _) = super::composer::footer_widths_for_test(150.0);
+    assert_eq!((model, effort), (0.0, 56.0));
+    // And only after the model is gone does the reasoning dropdown give up the rest.
+    let (model, effort, _) = super::composer::footer_widths_for_test(100.0);
+    assert_eq!(model, 0.0);
+    assert!(effort < 56.0, "the reasoning dropdown shrinks only once the model is gone");
+}
+
+#[test]
+fn the_composer_belongs_to_the_ai_dock_and_fits_its_narrowest_width() {
+    use crate::layers_drag_tests::Ui;
+    let mut u = Ui::new(figcraft_engine::Session::new());
+    u.ctx.enable_accesskit();
+    seed_models(&mut u.app.ui.ai);
+    u.app.ui.ai.draft_text = "restyle the header".into();
+
+    // File and Assets own the whole panel: no composer of theirs.
+    u.app.ui.left_tab = crate::LeftTab::File;
+    let file_frame = u.frame_output(vec![]);
+    let labels = |out: &egui::FullOutput| -> Vec<String> {
+        out.platform_output
+            .accesskit_update
+            .as_ref()
+            .map(|update| update.nodes.iter().filter_map(|(_, node)| node.label().map(str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    assert!(!labels(&file_frame).iter().any(|l| l == "Model"), "the File dock must not draw the AI composer");
+
+    for width in [200.0_f32, 280.0] {
+        u.app.ui.left_tab = crate::LeftTab::AiChat;
+        u.app.ui.left_collapsed = false;
+        u.app.ui.left_width = width;
+        let out = u.frame_output(vec![]);
+        let names = labels(&out);
+        assert_eq!(u.app.ui.left_width, width, "the dock keeps the width it was given");
+        for name in ["Model", "Reasoning effort", "Send"] {
+            assert!(names.iter().any(|l| l == name), "the {width}pt dock is missing {name}: {names:?}");
+        }
+        // Nothing spilled out of the dock: the canvas still starts at its edge.
+        assert!(u.app.canvas.rect.min.x >= width - 0.5, "the composer pushed into the canvas at {width}pt");
+    }
+}
+
+#[test]
+fn a_click_on_the_canvas_mentions_the_layer_it_picked() {
+    use crate::layers_drag_tests::Ui;
+    use egui::{Event, PointerButton, Pos2};
+
+    let mut session = figcraft_engine::Session::new();
+    session.execute("frame.create", &json!({"x": 0.0, "y": 0.0, "width": 200.0, "height": 200.0, "name": "Header"})).expect("frame");
+    let mut u = Ui::new(session);
+    seed_models(&mut u.app.ui.ai);
+    u.app.ui.left_tab = crate::LeftTab::AiChat;
+    u.frame(vec![]);
+
+    // The middle of the frame, in screen points, so the view's own zoom and pan don't matter.
+    let at: Pos2 = u.app.to_screen(100.0, 100.0);
+    let none = egui::Modifiers::default();
+    u.frame(vec![Event::PointerMoved(at)]);
+    u.frame(vec![Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, modifiers: none }]);
+    u.frame(vec![Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: none }]);
+
+    assert_eq!(u.app.ui.ai.draft_text, "@Header", "a click on the canvas mentions the layer under it");
 }

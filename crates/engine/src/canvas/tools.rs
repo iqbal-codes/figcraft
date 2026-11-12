@@ -236,12 +236,18 @@ pub struct PointerEvent {
     pub pressure: Option<f32>,
 }
 
-/// The pointer is still within [`DRAG_SLOP_PX`] of where it was pressed.
-pub(crate) fn within_slop(ev: &PointerEvent, start: Point) -> bool {
-    (ev.p() - start).hypot() * ev.zoom.max(1e-6) < DRAG_SLOP_PX
-}
-
 impl PointerEvent {
+    /// The pointer position on the page.
+    pub fn page_pos(&self) -> Point {
+        self.p()
+    }
+
+    /// The pointer is still within [`DRAG_SLOP_PX`] of where it was pressed, so the gesture is a
+    /// click rather than a drag.
+    pub fn within_click_slop(&self, start: Point) -> bool {
+        (self.p() - start).hypot() * self.zoom.max(1e-6) < DRAG_SLOP_PX
+    }
+
     pub fn at(kind: PointerKind, x: f64, y: f64, zoom: f64) -> Self {
         Self { kind, x, y, sx: x * zoom, sy: y * zoom, shift: false, alt: false, cmd: false, ctrl: false, zoom, pressure: None }
     }

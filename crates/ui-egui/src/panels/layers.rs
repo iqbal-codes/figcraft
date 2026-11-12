@@ -189,8 +189,10 @@ pub fn left_panel(app: &mut FigApp, ui: &mut Ui) {
     }
     ui.painter().line_segment([head.left_bottom(), head.right_bottom()], Stroke::new(1.0, t.border));
 
-    let comp_h = crate::ai::composer::COMPOSER_HEIGHT;
-    let content_h = (ui.available_height() - comp_h).max(0.0);
+    // The composer belongs to AI Chat alone, and the panel reserves its room only there: File and
+    // Assets get the whole height back.
+    let composer_h = if app.ui.left_tab == LeftTab::AiChat { crate::ai::composer::COMPOSER_HEIGHT.min(ui.available_height()) } else { 0.0 };
+    let content_h = (ui.available_height() - composer_h).max(0.0);
     let content_rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), content_h));
     ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect), |ui| match app.ui.left_tab {
         LeftTab::AiChat => crate::ai::panel::show(app, ui),
@@ -201,7 +203,11 @@ pub fn left_panel(app: &mut FigApp, ui: &mut Ui) {
         LeftTab::Assets => crate::assets_panel::show(app, ui),
     });
 
-    crate::ai::composer::show(app, ui);
+    if composer_h > 0.0 {
+        let full = ui.max_rect();
+        let composer_rect = Rect::from_min_max(pos2(full.min.x, (full.max.y - composer_h).max(full.min.y)), pos2(full.max.x, full.max.y));
+        crate::ai::composer::show(app, ui, composer_rect);
+    }
 }
 
 /// Draw the page list with open/search/add controls, filtering, selection, rename,

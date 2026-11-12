@@ -30,16 +30,69 @@ pub enum ServerMessage {
 /// Parsed event for UI and turn tracking.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
-    Initialized { models: Vec<String>, account_email: Option<String>, plan_type: Option<String> },
-    ThreadStarted { thread_id: String },
-    TurnStarted { thread_id: Option<String>, turn_id: String },
-    TurnCompleted { thread_id: Option<String>, turn_id: Option<String> },
-    AgentDelta { thread_id: Option<String>, turn_id: Option<String>, text: String },
-    ItemStarted { thread_id: Option<String>, turn_id: Option<String>, item_id: String, tool_name: Option<String> },
-    ItemCompleted { thread_id: Option<String>, turn_id: Option<String>, item_id: String, is_error: bool, summary: Option<String> },
-    ApprovalRequired { thread_id: Option<String>, turn_id: Option<String>, request_id: Value, action: String, target: String },
-    ToolCall { thread_id: Option<String>, turn_id: Option<String>, call_id: String, request_id: Value, name: String, params: Value },
-    Error { thread_id: Option<String>, message: String },
+    Initialized {
+        models: Vec<String>,
+        account_email: Option<String>,
+        plan_type: Option<String>,
+    },
+    ThreadStarted {
+        thread_id: String,
+    },
+    TurnStarted {
+        thread_id: Option<String>,
+        turn_id: String,
+    },
+    TurnCompleted {
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+    },
+    AgentDelta {
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        text: String,
+    },
+    ItemStarted {
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        item_id: String,
+        tool_name: Option<String>,
+    },
+    ItemCompleted {
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        item_id: String,
+        is_error: bool,
+        summary: Option<String>,
+    },
+    ApprovalRequired {
+        method: String,
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        request_id: Value,
+        action: String,
+        target: String,
+    },
+    ToolCall {
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        call_id: String,
+        request_id: Value,
+        name: String,
+        params: Value,
+    },
+    Notice {
+        thread_id: Option<String>,
+        message: String,
+    },
+    /// The harness answered a model listing with nothing usable. Discovery is over and the
+    /// catalog is empty; this is not a sign that the process died.
+    ModelDiscoveryFailed {
+        message: String,
+    },
+    Error {
+        thread_id: Option<String>,
+        message: String,
+    },
 }
 
 /// Parse a raw incoming line from the app-server.
@@ -142,7 +195,7 @@ pub fn message_to_event(msg: &ServerMessage) -> Option<ProtocolEvent> {
                 "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "item/permissions/requestApproval" => {
                     let action = params.get("action").and_then(Value::as_str).unwrap_or("permission request").to_string();
                     let target = params.get("target").or_else(|| params.get("command")).and_then(Value::as_str).unwrap_or("").to_string();
-                    Some(ProtocolEvent::ApprovalRequired { thread_id, turn_id, request_id: id.clone(), action, target })
+                    Some(ProtocolEvent::ApprovalRequired { method: method.clone(), thread_id, turn_id, request_id: id.clone(), action, target })
                 }
                 "item/tool/call" => {
                     let call_id = params.get("callId").and_then(Value::as_str).unwrap_or("").to_string();
@@ -219,48 +272,12 @@ pub fn format_error_response(id: &Value, code: i64, message: &str) -> String {
     .to_string()
 }
 
-/// Format an ApprovalResponse compliant with Codex app-server schema.
-pub fn format_approval_response(id: &Value, allow: bool) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "decision": if allow { "allow" } else { "deny" }
-        }
-    })
-    .to_string()
-}
-
-/// Format a schema-correct permission denial response for Codex app-server.
-pub fn format_permission_denial_response(id: &Value, method: &str, reason: &str) -> String {
+/// Deny the supported app-server approval variants without granting external access.
+/// An empty permission profile grants no filesystem or network permissions.
+pub fn permission_denial_result(method: &str) -> Option<Value> {
     match method {
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "decision": "decline"
-            }
-        })
-        .to_string(),
-        "item/execCommand/requestApproval" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "decision": {
-                    "denied": {
-                        "rejection": reason
-                    }
-                }
-            }
-        })
-        .to_string(),
-        _ => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "decision": "decline"
-            }
-        })
-        .to_string(),
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => Some(json!({"decision": "decline"})),
+        "item/permissions/requestApproval" => Some(json!({"permissions": {}, "scope": "turn"})),
+        _ => None,
     }
 }

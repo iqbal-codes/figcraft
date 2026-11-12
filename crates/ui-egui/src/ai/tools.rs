@@ -190,10 +190,7 @@ fn execute_create_frame(session: &mut Session, auth: &mut TaskAuthority, params:
     if let Some(obj) = p.as_object_mut()
         && !obj.contains_key("parent")
     {
-        let page_id = match auth.scope() {
-            TaskScope::NewRoot { page_id, .. } => *page_id,
-            TaskScope::Subtree { page_id, .. } => *page_id,
-        };
+        let page_id = auth.scope().page_id();
         obj.insert("parent".into(), json!(page_id.0));
     }
     auth.execute(session, "frame.create", &p)
@@ -208,10 +205,9 @@ fn execute_create_text(session: &mut Session, auth: &mut TaskAuthority, params: 
             obj.insert("text".into(), c);
         }
         if !obj.contains_key("parent") {
-            let default_parent = match auth.scope() {
-                TaskScope::NewRoot { task_root, page_id } => task_root.unwrap_or(*page_id),
-                TaskScope::Subtree { target_node, .. } => *target_node,
-            };
+            // A created layer lands in the first authorized object, so a task naming several
+            // objects never guesses a parent outside them.
+            let default_parent = auth.scope().first_root().unwrap_or_else(|| auth.scope().page_id());
             obj.insert("parent".into(), json!(default_parent.0));
         }
         let mut props = obj.get("props").and_then(Value::as_object).cloned().unwrap_or_default();
@@ -248,10 +244,9 @@ fn execute_create_shape(session: &mut Session, auth: &mut TaskAuthority, params:
         obj.remove("kind");
         obj.remove("shape");
         if !obj.contains_key("parent") {
-            let default_parent = match auth.scope() {
-                TaskScope::NewRoot { task_root, page_id } => task_root.unwrap_or(*page_id),
-                TaskScope::Subtree { target_node, .. } => *target_node,
-            };
+            // A created layer lands in the first authorized object, so a task naming several
+            // objects never guesses a parent outside them.
+            let default_parent = auth.scope().first_root().unwrap_or_else(|| auth.scope().page_id());
             obj.insert("parent".into(), json!(default_parent.0));
         }
     }
@@ -345,6 +340,9 @@ fn execute_batch_commands(session: &mut Session, auth: &mut TaskAuthority, param
     let result = session.grouped("AI canvas batch", |session| execute_batch_steps(session, auth, params));
     if result.is_err() {
         *auth = before_auth;
+    } else {
+        // The enclosing engine group may advance the revision after its last step.
+        auth.revision = session.ds()?.revision;
     }
     result
 }
@@ -371,10 +369,9 @@ fn execute_batch_steps(session: &mut Session, auth: &mut TaskAuthority, params: 
 
 fn execute_query_tree(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
     let doc = session.doc()?;
-    let default_root = match auth.scope() {
-        TaskScope::NewRoot { task_root, page_id } => task_root.unwrap_or(*page_id),
-        TaskScope::Subtree { target_node, .. } => *target_node,
-    };
+    // The first authorized object: reading it is also what refreshes the task context, so a task
+    // naming several objects re-reads that one first and then the others.
+    let default_root = auth.scope().first_root().unwrap_or_else(|| auth.scope().page_id());
     let start_id = params.get("node_id").and_then(Value::as_u64).map(NodeId).unwrap_or(default_root);
 
     if !auth.is_in_scope(doc, start_id) {
@@ -394,8 +391,13 @@ fn execute_query_tree(session: &mut Session, auth: &mut TaskAuthority, params: &
         truncated = true;
     }
 
+    if start_id == default_root {
+        auth.refresh_context(session)?;
+    }
+
     Ok(json!({
         "root": start_id.0,
+        "revision": session.ds()?.revision,
         "total_nodes": node_count,
         "truncated": truncated,
         "tree": tree
@@ -404,9 +406,12 @@ fn execute_query_tree(session: &mut Session, auth: &mut TaskAuthority, params: &
 
 fn execute_export_preview(session: &mut Session, auth: &mut TaskAuthority, params: &Value) -> Result<Value> {
     let doc = session.doc()?;
+    // A `NewRoot` task has no target to export until its first frame exists, so it stays `None`
+    // rather than falling back to the page.
     let default_target = match auth.scope() {
         TaskScope::NewRoot { task_root, .. } => *task_root,
         TaskScope::Subtree { target_node, .. } => Some(*target_node),
+        TaskScope::Subtrees { target_nodes, .. } => target_nodes.first().copied(),
     };
     let target_id = params
         .get("node_id")

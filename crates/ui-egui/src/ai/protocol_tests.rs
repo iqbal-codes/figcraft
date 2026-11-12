@@ -1,8 +1,8 @@
 use serde_json::json;
 
 use super::protocol::{
-    MAX_MESSAGE_SIZE, ProtocolEvent, ServerMessage, format_approval_response, format_dynamic_tool_response, format_notification, format_request,
-    format_response, message_to_event, parse_message_line,
+    MAX_MESSAGE_SIZE, ProtocolEvent, ServerMessage, format_dynamic_tool_response, format_notification, format_request, format_response,
+    message_to_event, parse_message_line,
 };
 
 #[test]
@@ -102,6 +102,7 @@ fn test_parse_server_approval_request() {
     assert_eq!(
         event,
         ProtocolEvent::ApprovalRequired {
+            method: "item/permissions/requestApproval".into(),
             thread_id: None,
             turn_id: None,
             request_id: json!("req_abc"),
@@ -148,6 +149,5 @@ fn test_format_request_notification_response_and_dynamic_tool() {
     assert!(tool_resp.contains(r#""success":true"#));
     assert!(tool_resp.contains(r#""inputText""#));
 
-    let appr_resp = format_approval_response(&json!("req_a1"), true);
-    assert!(appr_resp.contains(r#""decision":"allow""#));
+    assert_eq!(super::protocol::permission_denial_result("item/commandExecution/requestApproval"), Some(json!({"decision": "decline"})));
 }

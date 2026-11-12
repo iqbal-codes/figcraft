@@ -334,6 +334,8 @@ fn test_task_authority_revision_tracking_and_concurrent_external_edits() {
 
     // Task now executes mutation on TARGET: should detect external revision change,
     // revalidate that target node is still intact, and succeed without reverting sibling
+    assert!(task.execute(&mut s, "node.set", &json!({"id": target.0, "props": {"name": "Agent Edited Target"}})).is_err());
+    task.refresh_context(&s).unwrap();
     let res = task.execute(&mut s, "node.set", &json!({"id": target.0, "props": {"name": "Agent Edited Target"}}));
     assert!(res.is_ok(), "Mutation on valid target after concurrent edit should succeed: {:?}", res);
 
@@ -349,4 +351,188 @@ fn test_task_authority_revision_tracking_and_concurrent_external_edits() {
     // Subsequent task execution must be rejected because target node was deleted externally
     let after_delete_res = task.execute(&mut s, "shape.rectangle", &json!({"parent": target.0, "x": 10, "y": 10, "width": 20, "height": 20}));
     assert!(after_delete_res.is_err(), "Mutation must fail when target node was deleted externally");
+}
+
+/// A page holding two objects the user named (`a`, `b`) and an unrelated one (`c`).
+fn named_objects() -> (Session, NodeId, NodeId, NodeId, NodeId) {
+    let mut s = Session::new();
+    let page_id = s.page().unwrap();
+    let a = id_of(&s.execute("frame.create", &json!({"x": 0, "y": 0, "width": 100, "height": 100, "name": "A"})).unwrap());
+    let b = id_of(&s.execute("frame.create", &json!({"x": 200, "y": 0, "width": 100, "height": 100, "name": "B"})).unwrap());
+    let c = id_of(&s.execute("frame.create", &json!({"x": 400, "y": 0, "width": 100, "height": 100, "name": "C"})).unwrap());
+    (s, page_id, a, b, c)
+}
+
+fn subtrees_task(s: &Session, task_id: &str, page_id: NodeId, roots: &[NodeId]) -> TaskAuthority {
+    let doc_uid = s.ds().unwrap().uid;
+    let rev = s.ds().unwrap().revision;
+    let scope = TaskScope::subtrees_on(s.doc().unwrap(), page_id, roots.iter().copied()).unwrap();
+    TaskAuthority::new_with_revision(task_id, doc_uid, rev, scope)
+}
+
+#[test]
+fn subtrees_authorizes_every_named_object_but_not_their_siblings_or_the_page() {
+    let (mut s, page_id, a, b, c) = named_objects();
+    let mut task = subtrees_task(&s, "task-subtrees-01", page_id, &[a, b]);
+
+    assert!(task.execute(&mut s, "node.set", &json!({"id": a.0, "props": {"name": "A edited"}})).is_ok());
+    assert!(task.execute(&mut s, "node.set", &json!({"id": b.0, "props": {"name": "B edited"}})).is_ok());
+    assert_eq!(s.doc().unwrap().node(a).unwrap().name, "A edited");
+    assert_eq!(s.doc().unwrap().node(b).unwrap().name, "B edited");
+    assert!(task.provenance().modified_nodes.contains(&a));
+    assert!(task.provenance().modified_nodes.contains(&b));
+
+    // Reads and edits cover both named objects, and only them.
+    let doc = s.doc().unwrap();
+    assert!(task.is_in_scope(doc, a) && task.is_in_scope(doc, b));
+    assert!(!task.is_in_scope(doc, c));
+    assert!(!task.is_in_scope(doc, page_id));
+
+    // The unrelated object and the page that holds both named ones are out of scope.
+    let unrelated = task.execute(&mut s, "node.set", &json!({"id": c.0, "props": {"name": "C edited"}}));
+    assert!(unrelated.is_err(), "An unrelated sibling must be rejected: {unrelated:?}");
+    let ancestor = task.execute(&mut s, "node.set", &json!({"id": page_id.0, "props": {"name": "page edited"}}));
+    assert!(ancestor.is_err(), "The shared ancestor must be rejected: {ancestor:?}");
+    assert_eq!(s.doc().unwrap().node(c).unwrap().name, "C");
+}
+
+#[test]
+fn subtrees_refuses_deleting_a_named_object_and_rolls_back() {
+    let (mut s, page_id, a, b, _c) = named_objects();
+    let mut task = subtrees_task(&s, "task-subtrees-02", page_id, &[a, b]);
+
+    let before = s.doc().unwrap().clone();
+    let (undo_before, redo_before) = s.undo_depth();
+    let rev_before = s.ds().unwrap().revision;
+
+    let res = task.execute(&mut s, "edit.delete", &json!({"ids": [a.0]}));
+    assert!(res.is_err(), "Deleting a named object must fail: {res:?}");
+    assert!(s.doc().unwrap().contains(a), "The named object must survive");
+    assert!(s.doc().unwrap().changed_ids(&before, usize::MAX).unwrap().is_empty(), "The document must roll back");
+    assert_eq!(s.undo_depth(), (undo_before, redo_before), "History must roll back");
+    assert_eq!(s.ds().unwrap().revision, rev_before, "The revision must roll back");
+    assert!(task.provenance().deleted_nodes.is_empty());
+}
+
+#[test]
+fn subtrees_moves_layers_between_named_objects_and_rejects_leaving_the_union() {
+    let (mut s, page_id, a, b, c) = named_objects();
+    let layer = id_of(&s.execute("shape.rectangle", &json!({"parent": a.0, "x": 5, "y": 5, "width": 20, "height": 20})).unwrap());
+    let mut task = subtrees_task(&s, "task-subtrees-03", page_id, &[a, b]);
+
+    // A layer inside one named object moving into another stays inside the union.
+    let inside = task.execute(&mut s, "node.reparent", &json!({"ids": [layer.0], "parent": b.0}));
+    assert!(inside.is_ok(), "Moving between named objects must succeed: {inside:?}");
+    assert_eq!(s.doc().unwrap().node(layer).unwrap().parent, Some(b));
+
+    // The same layer leaving the union is refused, and the refused move rolls back.
+    let before = s.doc().unwrap().clone();
+    let leaving = task.execute(&mut s, "node.reparent", &json!({"ids": [layer.0], "parent": c.0}));
+    assert!(leaving.is_err(), "Moving a layer out of the union must fail: {leaving:?}");
+    assert_eq!(s.doc().unwrap().node(layer).unwrap().parent, Some(b), "The refused move must roll back");
+    assert!(s.doc().unwrap().changed_ids(&before, usize::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn subtrees_refuses_bringing_an_outside_layer_into_a_named_object() {
+    let (mut s, page_id, a, b, c) = named_objects();
+    let outside = id_of(&s.execute("shape.rectangle", &json!({"parent": c.0, "x": 5, "y": 5, "width": 20, "height": 20})).unwrap());
+    let mut task = subtrees_task(&s, "task-subtrees-04", page_id, &[a, b]);
+
+    let before = s.doc().unwrap().clone();
+    let imported = task.execute(&mut s, "node.reparent", &json!({"ids": [outside.0], "parent": a.0}));
+    assert!(imported.is_err(), "Importing an outside layer must fail: {imported:?}");
+    assert_eq!(s.doc().unwrap().node(outside).unwrap().parent, Some(c), "The refused import must roll back");
+    assert!(s.doc().unwrap().changed_ids(&before, usize::MAX).unwrap().is_empty());
+
+    // Its properties are refused too, so nothing outside the union is reachable.
+    assert!(task.execute(&mut s, "node.set", &json!({"id": outside.0, "props": {"name": "renamed"}})).is_err());
+    assert_eq!(s.doc().unwrap().node(outside).unwrap().name, "Rectangle");
+}
+
+#[test]
+fn subtrees_rejects_a_batch_mixing_authorized_and_unauthorized_edits() {
+    let (mut s, page_id, a, b, c) = named_objects();
+    let mut task = subtrees_task(&s, "task-subtrees-05", page_id, &[a, b]);
+
+    let res = task.execute(
+        &mut s,
+        "command.batch",
+        &json!({
+            "label": "Mixed edit",
+            "commands": [
+                {"command": "node.set", "params": {"id": a.0, "props": {"name": "A edited"}}},
+                {"command": "node.set", "params": {"id": c.0, "props": {"name": "C edited"}}}
+            ]
+        }),
+    );
+    assert!(res.is_err(), "A batch mixing authorized and unauthorized edits must fail");
+    assert_eq!(s.doc().unwrap().node(a).unwrap().name, "A", "The authorized step must roll back too");
+    assert_eq!(s.doc().unwrap().node(c).unwrap().name, "C");
+    assert!(task.provenance().modified_nodes.is_empty());
+}
+
+#[test]
+fn subtrees_rejects_empty_missing_and_off_page_roots() {
+    let (mut s, page_id, a, b, _c) = named_objects();
+
+    // An empty mention list is not a scope; the composer submits NewRoot instead.
+    assert!(TaskScope::subtrees(page_id, []).is_err());
+    assert!(TaskScope::subtrees_on(s.doc().unwrap(), page_id, []).is_err());
+
+    // Roots are deduplicated in the order they were mentioned.
+    let scope = TaskScope::subtrees(page_id, [b, a, b]).unwrap();
+    match &scope {
+        TaskScope::Subtrees { target_nodes, .. } => assert_eq!(target_nodes, &vec![b, a]),
+        other => panic!("expected Subtrees, got {other:?}"),
+    }
+
+    // A root that no longer exists is refused at submission.
+    let missing = TaskScope::subtrees_on(s.doc().unwrap(), page_id, [a, NodeId(99999)]);
+    assert!(missing.is_err(), "A missing object must be refused: {missing:?}");
+
+    // A root on another page is refused: the task stays bound to one page.
+    let other_page = s.doc_mut().unwrap().add_page("Second");
+    let elsewhere = id_of(&s.execute("frame.create", &json!({"parent": other_page.0, "x": 0, "y": 0, "width": 50, "height": 50})).unwrap());
+    let off_page = TaskScope::subtrees_on(s.doc().unwrap(), page_id, [a, elsewhere]);
+    assert!(off_page.is_err(), "An object on another page must be refused: {off_page:?}");
+}
+
+#[test]
+fn subtrees_rejects_a_stopped_task_and_a_stale_revision() {
+    let (mut s, page_id, a, b, c) = named_objects();
+
+    // Stopped: admission closes before any further mutation.
+    let mut stopped = subtrees_task(&s, "task-subtrees-06", page_id, &[a, b]);
+    stopped.stop();
+    let res = stopped.execute(&mut s, "node.set", &json!({"id": a.0, "props": {"name": "after stop"}}));
+    assert!(res.is_err(), "A stopped task must reject mutations: {res:?}");
+    assert!(res.unwrap_err().to_string().contains("stopped"));
+    assert_eq!(s.doc().unwrap().node(a).unwrap().name, "A");
+
+    // Stale: an external edit outside the union still blocks mutation until a read refreshes it.
+    let mut stale = subtrees_task(&s, "task-subtrees-07", page_id, &[a, b]);
+    s.execute("node.set", &json!({"id": c.0, "props": {"name": "Human edited C"}})).unwrap();
+    let rejected = stale.execute(&mut s, "node.set", &json!({"id": b.0, "props": {"name": "B edited"}}));
+    assert!(rejected.is_err(), "A stale task must re-read before editing: {rejected:?}");
+    stale.refresh_context(&s).unwrap();
+    assert!(stale.execute(&mut s, "node.set", &json!({"id": b.0, "props": {"name": "B edited"}})).is_ok());
+    assert_eq!(s.doc().unwrap().node(b).unwrap().name, "B edited");
+    assert_eq!(s.doc().unwrap().node(c).unwrap().name, "Human edited C");
+}
+
+#[test]
+fn subtrees_keeps_the_order_of_children_it_does_not_authorize() {
+    let (mut s, page_id, a, b, _c) = named_objects();
+    let mut task = subtrees_task(&s, "task-subtrees-08", page_id, &[a, b]);
+
+    // Adding a layer inside a named object changes only that object.
+    let added = task.execute(&mut s, "shape.rectangle", &json!({"parent": a.0, "x": 1, "y": 1, "width": 10, "height": 10}));
+    assert!(added.is_ok(), "Adding a layer inside a named object must succeed: {added:?}");
+
+    // Reordering the page's own children is not an edit to either named object.
+    let before = s.doc().unwrap().clone();
+    let reorder = task.execute(&mut s, "node.reorder", &json!({"id": a.0, "index": 2}));
+    assert!(reorder.is_err(), "Reordering the shared parent's children must fail: {reorder:?}");
+    assert!(s.doc().unwrap().changed_ids(&before, usize::MAX).unwrap().is_empty());
 }

@@ -107,6 +107,21 @@ impl FigApp {
             "selectedModel": self.ui.ai.selected_model,
             "availableModels": self.ui.ai.available_models,
             "draftText": self.ui.ai.draft_text,
+            "draftError": self.ui.ai.draft().error.clone(),
+            "draftMentions": self
+                .ui
+                .ai
+                .draft_mentions()
+                .iter()
+                .map(|m| json!({
+                    "label": m.label,
+                    "nodeId": m.node_id.0,
+                    "pageId": m.page_id.0,
+                    "docUid": m.doc_uid,
+                    "startChar": m.start_char,
+                    "endChar": m.end_char,
+                }))
+                .collect::<Vec<_>>(),
             "activeSessionIdx": self.ui.ai.active_session_idx,
             "sessionsCount": self.ui.ai.sessions.len(),
             "status": self.ui.ai.sessions.get(self.ui.ai.active_session_idx).map(|s| format!("{:?}", s.status)),
