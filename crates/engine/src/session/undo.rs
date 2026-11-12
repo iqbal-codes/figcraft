@@ -14,6 +14,7 @@ struct GroupDocCheckpoint {
     redo: Vec<HistoryEntry>,
     limit: usize,
     group_step: Option<usize>,
+    revision: u64,
 }
 
 struct GroupCheckpoint {
@@ -268,7 +269,7 @@ impl Session {
 
     /// Without a label, only roll back failures: leave successful steps' history to the outer group.
     /// A checkpoint also works between closing the last tab and opening another one.
-    fn checkpointed<T>(&mut self, label: Option<&str>, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    pub(crate) fn checkpointed<T>(&mut self, label: Option<&str>, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let before = self.group_checkpoint(label.is_some());
         // A panic in `f` ends the group like a failure, then goes on to the caller's guard (#1085);
         // the stand-in error only drives the rollback and is never returned.
@@ -334,6 +335,7 @@ impl Session {
                 redo: ds.history.redo.clone(),
                 limit: ds.history.limit,
                 group_step: ds.history.group_step,
+                revision: ds.revision,
             })
             .collect();
         let before = GroupCheckpoint {
@@ -376,6 +378,7 @@ impl Session {
                 ds.history.undo = saved.undo;
                 ds.history.limit = saved.limit;
                 ds.history.group_step = saved.group_step;
+                ds.revision = saved.revision;
             }
         }
         self.active = before.active;

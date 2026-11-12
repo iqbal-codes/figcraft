@@ -15,6 +15,7 @@ pub const UPDATE_APP: craft_update::app::App = craft_update::app::App {
 };
 
 pub mod a11y;
+pub mod ai;
 pub mod bidi;
 pub mod canvas;
 pub mod cjk;
@@ -419,6 +420,7 @@ pub struct UiState {
     /// The tab of the previous frame, to see the right panel change mode.
     pub last_right_tab: RightTab,
     pub left_tab: LeftTab,
+    pub ai: ai::AiState,
     pub pages_open: bool,
     /// Pages panel search: open, and the case-insensitive name filter.
     pub page_search: bool,
@@ -640,6 +642,7 @@ impl Default for UiState {
             right_tab: RightTab::Design,
             last_right_tab: RightTab::Design,
             left_tab: LeftTab::File,
+            ai: ai::AiState::default(),
             pages_open: true,
             page_search: false,
             page_filter: String::new(),

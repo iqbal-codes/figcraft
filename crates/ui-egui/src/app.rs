@@ -155,6 +155,10 @@ impl FigApp {
         let t0 = std::time::Instant::now();
         let ctx = ui.ctx().clone();
         self.ui_context = Some(ctx.clone());
+        // Whether the AI composer draws in this pass is answered by drawing it, below. Clearing it
+        // here, before any panel, keeps a canvas click from reaching a composer that is not on
+        // screen, and from a previous pass.
+        self.ui.ai.composer_visible = false;
         // `App::logic` already ticked this pass; direct harnesses do not call it. The marker only
         // covers the tick that shares this pass: clearing it here keeps a direct `App::ui` harness
         // ticking on every frame (it used to tick every other frame).
@@ -342,6 +346,7 @@ impl FigApp {
                 .show(ui, |ui| {
                     let label = match self.ui.left_tab {
                         _ if self.ui.versions.open => i18n::tr("Version history"),
+                        LeftTab::AiChat => i18n::tr("AI Chat"),
                         LeftTab::File => i18n::tr("Layers"),
                         LeftTab::Assets => i18n::tr("Assets"),
                     };

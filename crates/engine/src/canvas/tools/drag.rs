@@ -5,10 +5,35 @@ use super::handles::{
 use super::{
     Affine, ArcHandle, ArcHint, Cursor, Document, Gesture, Guide, Handle, ImageScaleMode, LayoutMode, NodeId, NodeKind, PaintKind, Point,
     PointerEvent, Rect, ResizeStart, Result, ScaleHint, Session, Sizing, Targets, TextAutoResize, ToolId, Vec2, move_world, roots, select_target,
-    textedit, within_slop,
+    textedit,
 };
 
 impl Session {
+    /// What a press at `ev` picks: a frame's name label, or the painted layer under the pointer,
+    /// after the board-background filtering the Move tool applies. `None` means the press reached
+    /// no object.
+    ///
+    /// Read-only, and exactly the resolution the Move tool uses when it starts a gesture, so a
+    /// click and a click that became a drag never disagree about what was picked. It deliberately
+    /// stops short of the drag fallback that turns a press inside the selection's box into the
+    /// selection itself: that is not a layer the user clicked.
+    pub fn canvas_click_target(&self, ev: &PointerEvent) -> Result<Option<NodeId>> {
+        let ds = self.ds()?;
+        let (doc, sel, page) = (ds.doc.clone(), ds.selection.clone(), ds.page);
+        let board_background = |leaf: NodeId| {
+            !sel.contains(&leaf)
+                && doc.node(leaf).is_some_and(|n| {
+                    n.parent == Some(page) && n.kind.is_frame_like() && !n.children.is_empty() && !crate::widgets::is_widget(n) && !n.is_board_atom()
+                })
+        };
+        let label = label_at(&doc, page, &self.tool.labels, ev.p());
+        Ok(label.or_else(|| {
+            self.hit(&doc, page, ev.p(), ev.tol() * 2.0)
+                .filter(|leaf| ev.cmd || !board_background(*leaf))
+                .map(|leaf| select_target(&doc, leaf, &sel, ev.cmd))
+        }))
+    }
+
     pub(super) fn move_down(&mut self, ev: &PointerEvent) -> Result<()> {
         let ds = self.ds()?;
         let (doc, sel, page) = (ds.doc.clone(), ds.selection.clone(), ds.page);
@@ -78,18 +103,8 @@ impl Session {
         // layers in it is like the canvas (a press starts a marquee inside it) unless the frame is
         // selected; an empty frame (or a widget, or a board object such as a sticky) is picked and
         // dragged.
-        let board_background = |leaf: NodeId| {
-            !sel.contains(&leaf)
-                && doc.node(leaf).is_some_and(|n| {
-                    n.parent == Some(page) && n.kind.is_frame_like() && !n.children.is_empty() && !crate::widgets::is_widget(n) && !n.is_board_atom()
-                })
-        };
         let label = label_at(&doc, page, &self.tool.labels, ev.p());
-        let target = label.or_else(|| {
-            self.hit(&doc, page, ev.p(), ev.tol() * 2.0)
-                .filter(|leaf| ev.cmd || !board_background(*leaf))
-                .map(|leaf| select_target(&doc, leaf, &sel, ev.cmd))
-        });
+        let target = self.canvas_click_target(ev)?;
         // A press inside the selection's box that reaches nothing above it (an unfilled shape's
         // inside, the frame or canvas behind it, or a layer stacked below the selected layer the
         // press is in) drags the selection. In a gap between selected layers, what's there is hit.
@@ -205,7 +220,7 @@ impl Session {
                 self.set_selection(sel);
                 Ok(())
             }
-            Gesture::Move { start, moved: false, .. } | Gesture::Resize { start, moved: false, .. } if within_slop(ev, *start) => Ok(()),
+            Gesture::Move { start, moved: false, .. } | Gesture::Resize { start, moved: false, .. } if ev.within_click_slop(*start) => Ok(()),
             Gesture::Move { start, ids, targets, duplicate, .. } => {
                 let mut d = ev.p() - *start;
                 if ev.shift {
@@ -441,7 +456,7 @@ impl Session {
             }
             Gesture::PenDrag { anchor } => {
                 // A click's wobble pulls out no handle.
-                let out = if within_slop(ev, *anchor) { Vec2::ZERO } else { ev.p() - *anchor };
+                let out = if ev.within_click_slop(*anchor) { Vec2::ZERO } else { ev.p() - *anchor };
                 if let Some(pen) = self.tool.pen.as_mut()
                     && let Some(last) = pen.points.last_mut()
                 {

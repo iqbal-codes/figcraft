@@ -87,6 +87,9 @@ pub struct CanvasState {
     pressure: Option<f32>,
     /// The latest scroll came from a mouse wheel rather than a trackpad (Scroll wheel zoom).
     wheel_is_mouse: bool,
+    /// A press that picked a layer and has not become a drag yet: where it went down, and what it
+    /// picked, so a release inside the click slop can mention that layer in the AI composer.
+    click: Option<(Point, NodeId)>,
 }
 
 impl Default for CanvasState {
@@ -115,6 +118,7 @@ impl Default for CanvasState {
             preedit: None,
             pressure: None,
             wheel_is_mouse: false,
+            click: None,
         }
     }
 }

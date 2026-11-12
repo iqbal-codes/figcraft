@@ -102,6 +102,32 @@ impl FigApp {
             "importReport": self.ui.import_report.as_ref().map(import_report::Report::inspect),
         });
         state["homeSearch"] = json!(self.ui.home_view.file_query);
+        state["ai"] = json!({
+            "isRunning": self.ui.ai.is_running,
+            "selectedModel": self.ui.ai.selected_model,
+            "availableModels": self.ui.ai.available_models,
+            "draftText": self.ui.ai.draft_text,
+            "draftError": self.ui.ai.draft().error.clone(),
+            "draftMentions": self
+                .ui
+                .ai
+                .draft_mentions()
+                .iter()
+                .map(|m| json!({
+                    "label": m.label,
+                    "nodeId": m.node_id.0,
+                    "pageId": m.page_id.0,
+                    "docUid": m.doc_uid,
+                    "startChar": m.start_char,
+                    "endChar": m.end_char,
+                }))
+                .collect::<Vec<_>>(),
+            "activeSessionIdx": self.ui.ai.active_session_idx,
+            "sessionsCount": self.ui.ai.sessions.len(),
+            "status": self.ui.ai.sessions.get(self.ui.ai.active_session_idx).map(|s| format!("{:?}", s.status)),
+            "threadId": self.ui.ai.sessions.get(self.ui.ai.active_session_idx).and_then(|s| s.thread_id.clone()),
+            "messagesCount": self.ui.ai.sessions.get(self.ui.ai.active_session_idx).map(|s| s.messages.len()).unwrap_or(0),
+        });
         state["panels"]["minimized"] = json!(self.session.ds().is_ok_and(|d| d.view.ui_minimized));
         // Set apart from the literal above, which is at the macro recursion limit.
         state["uiScale"] = json!({"choice": self.session.prefs.ui_scale, "zoom": self.ui.ui_scale.zoom, "drawn": self.ui.ui_scale.drawn, "limited": self.ui.ui_scale.limited});

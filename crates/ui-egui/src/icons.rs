@@ -50,6 +50,8 @@ icons! {
     TextOnPath,
     Comment,
     Actions,
+    /// AI Chat / sparkle mark.
+    AiChat,
     Chevron,
     ChevronRight,
     ChevronLeft,

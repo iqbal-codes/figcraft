@@ -7,6 +7,7 @@ pub enum RightTab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum LeftTab {
+    AiChat,
     File,
     Assets,
 }

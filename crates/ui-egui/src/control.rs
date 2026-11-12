@@ -1156,7 +1156,42 @@ fn ui_set_view(app: &mut FigApp, ctx: &Context, p: &Value) -> Result<(), String>
         };
     }
     if let Some(t) = p.get("leftTab").and_then(Value::as_str) {
-        app.ui.left_tab = if t == "assets" { crate::LeftTab::Assets } else { crate::LeftTab::File };
+        app.ui.left_tab = match t {
+            "ai" | "aiChat" | "AiChat" => {
+                app.ui.open_left_panel();
+                crate::LeftTab::AiChat
+            }
+            "assets" | "Assets" => crate::LeftTab::Assets,
+            _ => crate::LeftTab::File,
+        };
+    }
+    if let Some(m) = p.get("aiModel").and_then(Value::as_str) {
+        app.ui.ai.select_model(m);
+    }
+    if let Some(eff) = p.get("aiEffort").and_then(Value::as_str) {
+        app.ui.ai.select_effort(Some(eff.to_string()));
+    }
+    // A mention is authority over an object, so it can only come from clicking that object on the
+    // canvas; a request cannot spell one into existence.
+    if p.get("mentions").is_some() {
+        return Err("aiDraft replaces the draft text only: mentions come from clicking a layer on the canvas".into());
+    }
+    if let Some(draft) = p.get("aiDraft").and_then(Value::as_str) {
+        app.ui.ai.replace_draft_text(draft);
+        app.ui.ai.sync_draft_editor(ctx);
+    }
+    if let Some(submit) = p.get("aiSubmit").and_then(Value::as_bool)
+        && submit
+        && !app.ui.ai.draft_text.trim().is_empty()
+    {
+        app.ui.left_tab = crate::LeftTab::AiChat;
+        app.ui.open_left_panel();
+        app.ui.ai.submit_turn(&mut app.session);
+    }
+    if let Some(stop) = p.get("aiStop").and_then(Value::as_bool)
+        && stop
+    {
+        app.ui.ai.stop_running_task();
     }
     if let Some(t) = p.get("theme").and_then(Value::as_str) {
         app.session.prefs.theme = t.to_string();
